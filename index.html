@@ -65,12 +65,22 @@
     .budget-piece span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .start { width: 20%; background: color-mix(in srgb, var(--brand) 62%, transparent); }
     .finish { width: 20%; background: color-mix(in srgb, var(--second) 68%, transparent); }
-    .kept { width: 60%; background: var(--reserve); }
+    .tools { width: 14.5%; background: color-mix(in srgb, #b9874f 62%, transparent); }
+    .launch { width: 24.3%; background: color-mix(in srgb, #6f7795 58%, transparent); }
+    .kept { width: 21.2%; background: var(--reserve); }
     .fair { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
     .reason { padding-left: 13px; border-left: 3px solid var(--line); }
     .reason:first-child { border-left-color: var(--brand); }
     .reason strong { display: block; margin-bottom: 4px; }
     .reason p { color: var(--muted); font-size: .88rem; }
+    .costs { border-top: 1px solid var(--line); }
+    .cost-row { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: start; padding: 13px 0; border-bottom: 1px solid var(--line); }
+    .cost-name strong { display: block; }
+    .cost-name span { display: block; margin-top: 2px; color: var(--muted); font-size: .86rem; }
+    .cost-value { font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .cost-total { font-size: 1.05rem; }
+    .cost-note { color: var(--muted); font-size: .86rem; }
+    .cost-note a { color: inherit; text-underline-offset: 3px; }
     .steps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .step { padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); }
     .step-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 13px; }
@@ -119,7 +129,7 @@
     <header class="hero">
       <p class="eyebrow">Kits for Kids · App proposal</p>
       <h1>$200 to start.<br>$200 when it is complete.</h1>
-      <p class="lede">A simple, low-risk agreement: Kits for Kids pays only 20% of its $1,000 budget to begin, pays another 20% after approving the completed app, and keeps the remaining 60% for launch and future needs.</p>
+      <p class="lede">A simple, low-risk agreement: Kits for Kids pays only 20% of its $1,000 budget to begin and another 20% after approving the completed app. Every expected subscription and launch cost is shown below.</p>
     </header>
 
     <main id="proposal">
@@ -135,24 +145,41 @@
           <div class="card-note">Paid only after the agreed app is complete, tested, adjusted, and ready for handoff.</div>
         </article>
         <article class="card">
-          <div class="card-label">Kits for Kids keeps</div>
-          <div class="card-value">$600</div>
-          <div class="card-note">Reserved for hosting, subscriptions, app-store publishing, and future operating costs.</div>
+          <div class="card-label">Uncommitted reserve</div>
+          <div class="card-value">$212</div>
+          <div class="card-note">Still available after the $400 service fee and every launch cost listed below.</div>
         </article>
       </div>
 
       <section class="section" aria-labelledby="budget-title">
         <h2 id="budget-title">Where the $1,000 budget goes</h2>
-        <div class="budget-bar" role="img" aria-label="$200 kickoff payment, $200 completion payment, and $600 retained by Kits for Kids">
+        <div class="budget-bar" role="img" aria-label="$200 kickoff payment, $200 completion payment, $145 development tools, $243 publishing and domain costs, and $212 uncommitted reserve">
           <div class="budget-piece start"><span>$200 start</span></div>
           <div class="budget-piece finish"><span>$200 finish</span></div>
-          <div class="budget-piece kept"><span>$600 stays with Kits for Kids</span></div>
+          <div class="budget-piece tools"><span>$145 tools</span></div>
+          <div class="budget-piece launch"><span>$243 publishing</span></div>
+          <div class="budget-piece kept"><span>$212 reserve</span></div>
         </div>
         <div class="fair">
           <div class="reason"><strong>Low risk to begin</strong><p>Only $200 is committed before there is a working version to review.</p></div>
           <div class="reason"><strong>Payment follows results</strong><p>The final $200 is tied to completion and approval of the agreed scope.</p></div>
-          <div class="reason"><strong>The nonprofit stays protected</strong><p>Most of the available budget remains under Kits for Kids’ control.</p></div>
+          <div class="reason"><strong>No hidden costs</strong><p>Subscriptions and publishing costs are listed separately from the developer’s compensation.</p></div>
         </div>
+      </section>
+
+      <section class="section" aria-labelledby="costs-title">
+        <h2 id="costs-title">Specific subscriptions and launch costs</h2>
+        <div class="costs">
+          <div class="cost-row"><div class="cost-name"><strong>ChatGPT Pro — one month</strong><span>The $100 high-usage tier provides 5× the Plus usage allowance for focused planning, coding, debugging, and testing. It is not unlimited.</span></div><div class="cost-value">$100</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Vercel Pro — first month</strong><span>Production web hosting with $20 of included usage credit.</span></div><div class="cost-value">$20</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Supabase Pro — first month</strong><span>Database, authentication, file storage, and backups for the app.</span></div><div class="cost-value">$25</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Domain allowance</strong><span>Estimated first-year domain registration.</span></div><div class="cost-value">$20</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Apple Developer</strong><span>Annual publishing membership. Eligible nonprofits can request a fee waiver.</span></div><div class="cost-value">$99</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Google Play Console</strong><span>One-time Android publishing registration.</span></div><div class="cost-value">$25</div></div>
+          <div class="cost-row"><div class="cost-name"><strong>Microsoft Store organization account</strong><span>Approximate one-time organization registration.</span></div><div class="cost-value">$99</div></div>
+          <div class="cost-row"><div class="cost-name cost-total"><strong>Total estimated launch costs</strong></div><div class="cost-value cost-total">$388</div></div>
+        </div>
+        <p class="cost-note">Vercel and Supabase offer free starting tiers; these paid amounts are conservative one-month launch allowances. If a free tier or the Apple nonprofit waiver is used, the savings return to the $212 reserve. Production accounts should be owned by Kits for Kids. Sources: <a href="https://help.openai.com/en/articles/9793128/">OpenAI</a>, <a href="https://vercel.com/pricing">Vercel</a>, <a href="https://supabase.com/pricing">Supabase</a>, <a href="https://developer.apple.com/programs/enroll/">Apple</a>, <a href="https://support.google.com/googleplay/android-developer/answer/6112435?hl=en-1">Google Play</a>, and <a href="https://learn.microsoft.com/en-us/windows/apps/publish/faq/get-started-with-the-microsoft-store">Microsoft</a>.</p>
       </section>
 
       <section class="section" aria-labelledby="work-title">
@@ -230,7 +257,7 @@
 
       function proposalText() {
         const value = Number(hours.value);
-        return `KITS FOR KIDS — SIMPLE APP PROPOSAL\n\nTOTAL DEVELOPMENT FEE: $400\n\n$200 DUE AT KICKOFF\nThis reserves development time and covers the initial project setup, necessary development tools, the first working version, and one organized feedback round.\n\n$200 DUE AFTER COMPLETION\nThis is paid after the agreed app is completed and approved. It covers the agreed adjustments, testing, polish, launch preparation, source-code delivery, and account handoff.\n\nKITS FOR KIDS KEEPS $600\nThe remaining 60% of the $1,000 budget stays under the nonprofit’s control for hosting, subscriptions, app-store publishing, and future operating needs.\n\nTIME AND VALUE\nEstimated work: ${value} hours\nEffective project rate: $${(400 / value).toFixed(2)} per hour\n\nSCOPE\nReasonable adjustments to the agreed app are included through one organized feedback round. New features or major scope changes are discussed and approved separately before additional work begins.\n\nThis structure protects both sides: the developer can begin without personally carrying all initial costs, while Kits for Kids pays the final half only after seeing and approving the completed work.`;
+        return `KITS FOR KIDS — SIMPLE APP PROPOSAL\n\nTOTAL DEVELOPMENT FEE: $400\n\n$200 DUE AT KICKOFF\nThis reserves development time and covers the initial project setup, the first working version, and one organized feedback round.\n\n$200 DUE AFTER COMPLETION\nThis is paid after the agreed app is completed and approved. It covers the agreed adjustments, testing, polish, launch preparation, source-code delivery, and account handoff.\n\nSPECIFIC LAUNCH COSTS\n• ChatGPT Pro high-usage tier for one month: $100\n• Vercel Pro for one month: $20\n• Supabase Pro for one month: $25\n• Domain allowance: $20\n• Apple Developer membership: $99 (eligible nonprofits may request a waiver)\n• Google Play Console: $25 one-time\n• Microsoft Store organization account: approximately $99 one-time\nTotal estimated launch costs: $388\n\nBUDGET REMAINING\n$1,000 budget - $400 development fee - $388 launch costs = $212 uncommitted reserve. Free tiers or approved fee waivers return additional money to the reserve.\n\nTIME AND VALUE\nEstimated work: ${value} hours\nEffective project rate: $${(400 / value).toFixed(2)} per hour\n\nSCOPE\nReasonable adjustments to the agreed app are included through one organized feedback round. New features or major scope changes are discussed and approved separately before additional work begins.\n\nThis structure protects both sides: the developer can begin without personally carrying all initial costs, while Kits for Kids pays the final half only after seeing and approving the completed work.`;
       }
 
       hours.addEventListener('input', updateTime);
