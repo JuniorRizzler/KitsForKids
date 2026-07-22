@@ -1,7 +1,9 @@
-# Kits for Kids — App Investment Plan
+# Kits for Kids — Simple App Proposal
 
-An interactive, responsive proposal for planning a nonprofit app launch within a $1,000 budget.
+A straightforward interactive proposal built around a $400 development fee:
 
-Open `index.html` in a browser. Use the controls to compare AI plans, publishing strategies, delivery assumptions, and payment milestones. The **Copy board-ready summary** button produces a plain-text version of the selected scenario.
+- $200 to begin
+- $200 after the agreed app is complete and approved
+- $600 of the nonprofit's $1,000 budget remains available for launch and ongoing costs
 
-Pricing and productivity figures are estimates or external references and should be verified before an agreement is signed.
+Open `index.html` in a browser. The time slider shows the effective project rate, and the copy button creates a plain-text proposal ready to send.
