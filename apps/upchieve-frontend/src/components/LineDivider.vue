@@ -1,0 +1,37 @@
+<template>
+  <div class="uc-row items-center w-full break-line-container">
+    <span class="break-line"></span>
+    <p v-if="text" class="text">{{ text }}</p>
+    <span class="break-line"></span>
+  </div>
+</template>
+
+<script>
+export default {
+  props: {
+    text: {
+      type: String,
+    },
+  },
+}
+</script>
+
+<style lang="scss" scoped>
+.break-line-container {
+  margin-top: 16px;
+}
+
+.break-line {
+  background-color: #c4c4c4;
+  flex-grow: 1;
+  height: 1px;
+}
+
+.text {
+  color: $c-secondary-grey;
+  font-style: italic;
+  padding: 0 30px;
+  margin: 0;
+  width: fit-content;
+}
+</style>

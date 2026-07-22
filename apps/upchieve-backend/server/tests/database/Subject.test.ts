@@ -1,0 +1,57 @@
+/**
+ * @group database/parallel
+ */
+import * as SubjectRepo from '../../models/Subjects'
+import { SUBJECTS } from '../../constants'
+
+describe('getRequiredCertificationsByComputedSubjectUnlock', () => {
+  const expectedMapping = {
+    [SUBJECTS.INTEGRATED_MATH_ONE]: [
+      SUBJECTS.ALGEBRA_ONE,
+      SUBJECTS.GEOMETRY,
+      SUBJECTS.STATISTICS,
+    ],
+    [SUBJECTS.INTEGRATED_MATH_TWO]: [
+      SUBJECTS.ALGEBRA_ONE,
+      SUBJECTS.GEOMETRY,
+      SUBJECTS.STATISTICS,
+      SUBJECTS.TRIGONOMETRY,
+    ],
+    [SUBJECTS.INTEGRATED_MATH_THREE]: [
+      SUBJECTS.PRECALCULUS,
+      SUBJECTS.STATISTICS,
+    ],
+    [SUBJECTS.INTEGRATED_MATH_FOUR]: [SUBJECTS.PRECALCULUS],
+  }
+  it('Returns the required certifications for computed subjects', async () => {
+    const actual =
+      await SubjectRepo.getRequiredCertificationsByComputedSubjectUnlock()
+    const actualKeys = Object.keys(actual) as SUBJECTS[]
+    const expectedKeys = Object.keys(expectedMapping) as SUBJECTS[]
+    expect(new Set<SUBJECTS>(actualKeys)).toEqual(
+      new Set<SUBJECTS>(expectedKeys)
+    )
+
+    expect(actual).toEqual(expectedMapping)
+  })
+})
+
+describe('getSubjectsWithTopic - alias subjects', () => {
+  it('resolves the reused quiz for an alias subject', async () => {
+    const subjects = await SubjectRepo.getSubjectsWithTopic()
+    expect(subjects.apChemistry.unlockQuizName).toEqual('chemistry')
+    expect(subjects.apCalculusAB.unlockQuizName).toEqual('calculusAB')
+  })
+
+  it('resolves a single default quiz when an alias is unlocked by multiple certs', async () => {
+    const subjects = await SubjectRepo.getSubjectsWithTopic()
+    expect(subjects.apPhysics1.unlockQuizName).toEqual('physicsOne')
+    expect(subjects.apusHistory.unlockQuizName).toEqual('usHistory')
+    expect(subjects.apWorldHistory.unlockQuizName).toEqual('worldHistory')
+  })
+
+  it('leaves unlockQuizName undefined for a subject with its own quiz', async () => {
+    const subjects = await SubjectRepo.getSubjectsWithTopic()
+    expect(subjects.algebraOne.unlockQuizName).toBeUndefined()
+  })
+})

@@ -1,0 +1,23 @@
+# version 1.0.3
+
+# This image gives us access to both Docker CLI and Azure CLI for use in CI.
+#
+# The image is pushed to the subway container registry as `gitlab-ci-image`.
+# TODO: Consider putting this into its own repository/registry.
+#
+# To get the image into GitLab container registry, do the following:
+# - Login to the GitLab registry.
+#    $ echo <password or personal access token with read/write registry> | docker login registry.gitlab.com -u <username> --password-stdin
+# - Build this image.
+#    $ docker build -t registry.gitlab.com/upchieve/subway/gitlab-ci-image:<version> - < Dockerfile-gitlab-ci-image
+# - Push the image.
+#    $ docker push registry.gitlab.com/upchieve/subway/gitlab-ci-image:<version>
+# - Update the image in .gitlab-ci.yml with the correct version.
+FROM mcr.microsoft.com/azure-cli:2.84.0
+
+# docker-cli-25.0.7 image is the latest available in Azure Linux in azure-cli:2.84.0 image.
+# Check available versions with:
+# $ docker run --rm mcr.microsoft.com/azure-cli:2.84.0 tdnf repoquery docker-cli --available
+RUN tdnf install -y docker-cli-25.0.7
+
+CMD ["sh"]

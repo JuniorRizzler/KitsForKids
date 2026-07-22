@@ -1,0 +1,245 @@
+import socketio, { Socket } from 'socket.io'
+import { difference, intersection } from 'lodash'
+import type { RemoteSocket } from 'socket.io'
+import logger from '../logger'
+import { Ulid, Uuid } from '../models/pgUtils'
+import {
+  getUnfulfilledSessions,
+  UnfulfilledSessions,
+} from '../models/Session/queries'
+import getSessionRoom from '../utils/get-session-room'
+import { ProgressReport } from '../services/ProgressReportsService'
+import { ProgressReportAnalysisTypes } from '../models/ProgressReports'
+import { TransactionClient } from '../db'
+import * as SessionService from '../services/SessionService'
+import * as cache from '../cache'
+import { backOff } from 'exponential-backoff'
+import { UserContactInfo } from '../models/User'
+import { secondsInMs } from '../utils/time-utils'
+import { toCurrentSessionPublic } from '../public/sessions'
+
+// TODO: Remove class wrapper.
+class SocketService {
+  private static instance: SocketService
+  private io: socketio.Server
+
+  private constructor(io: socketio.Server) {
+    this.io = io
+  }
+
+  // Allow singleton use of SocketService
+  static getInstance(io?: socketio.Server): SocketService {
+    if (!SocketService.instance) {
+      if (!io) throw new Error('SocketService has not been initialized')
+      SocketService.instance = new SocketService(io)
+    }
+    return SocketService.instance
+  }
+
+  async joinSession(socket: Socket, user: UserContactInfo, sessionId: Uuid) {
+    logger.info({ userId: user.id, sessionId }, 'Joining session')
+    try {
+      await SessionService.ensureCanJoinSession(user, sessionId)
+    } catch (error) {
+      logger.error(
+        { userId: user.id, sessionId, error: JSON.stringify(error) },
+        'User cannot join session'
+      )
+      delete socket.data.sessionId
+      throw error
+    }
+
+    const sessionRoom = getSessionRoom(sessionId)
+    logger.info(
+      { sessionRoom, sessionId },
+      'Got session room. Joining to the room now.'
+    )
+    await socket.join(sessionRoom)
+    socket.data.sessionId = sessionId
+
+    await this.emitSessionChange(sessionId)
+    await this.emitSessionPresence(user.id, sessionRoom, true)
+  }
+
+  async leaveSession(socket: Socket, user: UserContactInfo, sessionId: Uuid) {
+    const sessionRoom = getSessionRoom(sessionId)
+    await socket.leave(sessionRoom)
+    delete socket.data.sessionId
+
+    await this.emitSessionPresence(user.id, sessionRoom, false)
+  }
+
+  async emitSessionPresence(
+    userId: string,
+    roomName: string,
+    hasJoined: boolean
+  ) {
+    logger.info(
+      { userId, roomName, hasJoined },
+      'Emitting session presence: Fetching sockets'
+    )
+    const sessionSocketIds = await this.getAllSocketIdsInRoom(roomName)
+    const userSocketIds = await this.getAllSocketIdsInRoom(userId)
+    logger.info(
+      { userId, roomName, hasJoined, userSocketIds, sessionSocketIds },
+      'Emitting session presence: Got back sockets'
+    )
+
+    if (hasJoined) {
+      // Emit to self if partner is connected to the session or not.
+      // If there are any sockets in the session room that are not this user's,
+      // we can assume the partner is in the room.
+      const partnerSocketsInSession = difference(
+        sessionSocketIds,
+        userSocketIds
+      )
+      this.io
+        .to(userId)
+        .emit('sessions/partner:in-session', !!partnerSocketsInSession.length)
+    }
+
+    // Emit to partner whether in the room.
+    // If there are any sockets in the session for this user, they are in
+    // the room.
+    const userSocketsInSession = intersection(sessionSocketIds, userSocketIds)
+    this.io
+      .to(roomName)
+      .except(userId)
+      .emit('sessions/partner:in-session', !!userSocketsInSession.length)
+  }
+
+  private async updateSessionList(tc?: TransactionClient): Promise<void> {
+    const sessions = await getUnfulfilledSessions(tc)
+    const sessionsWithExclusiveMetadata =
+      await this.addExclusiveSessionMetadata(sessions)
+    this.io.in('volunteers').emit('sessions', sessionsWithExclusiveMetadata)
+  }
+
+  async addExclusiveSessionMetadata(allSessions: UnfulfilledSessions[]) {
+    const exclusiveSessions = await cache.hgetall('exclusiveRequestSessions')
+    return allSessions.map((session) => {
+      const requestedVolunteerId = exclusiveSessions[session.id]
+      return requestedVolunteerId
+        ? { ...session, isExclusive: true, requestedVolunteerId }
+        : session
+    })
+  }
+
+  async emitSessionChange(
+    sessionId: Ulid,
+    tc?: TransactionClient
+  ): Promise<void> {
+    const session = await SessionService.getCurrentSessionById(sessionId, tc)
+    const sessionParticipants = [session.student.id]
+    if (session.volunteer?.id) {
+      sessionParticipants.push(session.volunteer.id)
+    }
+    this.io
+      .in(sessionParticipants)
+      .timeout(secondsInMs(5))
+      .emit('session-change', toCurrentSessionPublic(session))
+
+    await this.updateSessionList(tc)
+  }
+
+  async emitTutorBotMessage(sessionId: Ulid, messageData: any): Promise<void> {
+    const socketRoom = getSessionRoom(sessionId)
+    this.io.in(socketRoom).emit('tutorBotConversationMessage', messageData)
+  }
+
+  async emitProgressReportProcessedToUser(
+    userId: Ulid,
+    data: {
+      report: ProgressReport
+      subject: string
+      sessionId?: Ulid
+      analysisType: ProgressReportAnalysisTypes
+    }
+  ) {
+    this.io.to(userId).emit('progress-report:processed:overview', data)
+  }
+
+  async emitUserLiveMediaBannedEvents(
+    userId: string,
+    sessionId: string
+  ): Promise<void> {
+    this.io
+      .to(getSessionRoom(sessionId))
+      .except(userId)
+      .emit('sessions:partner-banned-from-live-media')
+    this.io.to(userId).emit('sessions:banned-from-live-media')
+  }
+
+  async emitModerationInfractionEvent(
+    userId: string,
+    data: {
+      isBanned: boolean
+      infraction: string[]
+      source: string
+      occurredAt: Date
+      stopStreamImmediatelyReasons: string[]
+    }
+  ): Promise<void> {
+    this.io.to(userId).emit('moderation-infraction', data)
+  }
+
+  async emitPotentialInfractionToPartnerEvent(
+    sessionId: string,
+    currentUserId: string,
+    data: {
+      infraction: string[]
+      source: string
+      occurredAt: Date
+    }
+  ) {
+    const context = {
+      ...data,
+      sessionId,
+      partner: currentUserId,
+    }
+    logger.info('sent potentialPartnerModerationInfraction event', context)
+    this.io
+      .to(getSessionRoom(sessionId))
+      .except(currentUserId)
+      .emit('potentialPartnerModerationInfraction', context)
+  }
+
+  // TODO: Remove once no longer have legacy mobile app.
+  bump(
+    socket: socketio.Socket,
+    data: {
+      endedAt?: Date
+      volunteer?: Ulid
+      student: Ulid
+      sessionId: Ulid
+      userId: Ulid
+    },
+    err: Error
+  ): void {
+    logger.error(
+      `User ${data.userId} could not join session ${data.sessionId}: ${err}`
+    )
+    socket.emit('bump', data, err.toString())
+  }
+
+  private async getAllSocketIdsInRoom(roomName: string): Promise<string[]> {
+    const sockets = await this.getAllSocketsInRoom(roomName)
+    return sockets.map((socket) => socket.id)
+  }
+
+  private async getAllSocketsInRoom(
+    roomName: string
+  ): Promise<RemoteSocket<any, any>[]> {
+    try {
+      const sockets = await backOff(() => this.io.in(roomName).fetchSockets())
+      return sockets
+    } catch (error) {
+      logger.error(
+        `Failed to fetch sockets. ${JSON.stringify({ error, roomName })}`
+      )
+      return []
+    }
+  }
+}
+
+export default SocketService

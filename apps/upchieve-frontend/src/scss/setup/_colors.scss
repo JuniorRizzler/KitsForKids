@@ -1,0 +1,93 @@
+@use 'sass:color';
+@use 'sass:map';
+/// Used for primary text.
+$c-soft-black: #343440;
+
+/// Used for secondary text and icons.
+$c-secondary-grey: #77778b;
+
+/// Used for disabled text.
+$c-disabled-grey: #abb2bd;
+
+/// Used for borders and hint text.
+$c-border-grey: #d6e0ef;
+
+/// Used for backgrounds.
+$c-background-blue: #e3f2fd;
+
+/// Used for backgrounds.
+$c-background-grey: #f1f3f6;
+
+/// Used for minor text
+$c-default-grey: #666f7d;
+
+/// Used for primary actions and to indicate success.
+$c-success-green: #16d2aa;
+
+/// Used to indicate an error or destructive action.
+$c-error-red: #f44747;
+
+/// Used to warn the user.
+$c-warning-orange: #ff8c5f;
+
+/// Used to draw the user's attention to important info.
+$c-information-blue: #1855d1;
+
+//Used for banned student state
+$c-banned-grey: #8b939f;
+
+// Old design colors
+$c-accent: #16d2aa;
+$c-backdrop-clear: #f0f7fd;
+$c-backdrop-warn: #feeab2;
+$c-backdrop: #e3f2fd;
+$c-backdrop-translucent: rgb(227, 242, 253, 0.85);
+$c-bg: #f6f6f6;
+$c-college: #fed766;
+$c-math: #f7aef8;
+$c-sat: #54defd;
+$c-shadow-header: #e1e1e1;
+$c-shadow-warn: #f44747;
+$c-shadow: #1855d1;
+
+// Override default bootstrap variables
+$success: $c-success-green;
+$theme-colors: () !default;
+$theme-colors: map.merge(
+  (
+    'primary': #16d2aa,
+    'warning': #ff8c5f,
+    'danger': #f44747,
+  ),
+  $theme-colors
+);
+
+// New design colors
+$upchieve-green: #8ae8d4;
+$upchieve-white: #fff;
+$upchieve-chat-bot-green: #e9f9f5;
+$selected-green: #f2fbf9;
+$border-grey: #d8dee5;
+$light-blue-background: #f1f8fe;
+$step-blue: #1855d166;
+$icon-grey: #676879;
+
+$uc-primary-blue: $c-information-blue;
+
+$button-primary-bg: $c-information-blue;
+$button-primary-bg-hover: #103a90;
+$button-primary-bg-disabled: $c-background-grey;
+$button-primary-text: #fff;
+$button-primary-text-disabled: #8b939f;
+
+$button-secondary-bg: white;
+$button-secondary-bg-hover: #1855d11a;
+$button-secondary-text: #343440;
+$button-secondary-border: #d8dee5;
+$button-secondary-border-hover: $c-information-blue;
+
+$c-student: #f9bef9;
+$c-volunteer: #fedf85;
+$c-teacher: #76e5fd;
+
+$c-hover-green: #0d8269;

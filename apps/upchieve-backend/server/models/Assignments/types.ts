@@ -1,0 +1,71 @@
+import { Ulid, Uuid } from '../pgUtils'
+
+export type Assignment = {
+  id: Ulid
+  classId: Ulid
+  description?: string
+  dueDate?: Date
+  isRequired: boolean
+  minDurationInMinutes?: number
+  numberOfSessions?: number
+  startDate?: Date
+  subjectId?: number
+  title?: string
+  createdAt: Date
+  updatedAt: Date
+  // TODO: Remove after experiment is done
+  isGettingStartedAssignment?: boolean
+}
+
+export type CreateAssignmentInput = Pick<
+  Assignment,
+  | 'classId'
+  | 'description'
+  | 'dueDate'
+  | 'isRequired'
+  | 'minDurationInMinutes'
+  | 'numberOfSessions'
+  | 'startDate'
+  | 'subjectId'
+  | 'title'
+>
+
+export type EditAssignmentInput = Omit<
+  Assignment,
+  'classId' | 'createdAt' | 'updatedAt'
+>
+
+export type StudentAssignment = {
+  id: Ulid
+  assignedAt: Date
+  classId?: Ulid
+  className?: string
+  description?: string
+  title?: string
+  numberOfSessions?: number
+  minDurationInMinutes?: number
+  isRequired: boolean
+  dueDate?: Date
+  startDate?: Date
+  subjectId?: number
+  subjectName?: string
+  submittedAt?: Date
+}
+
+export type CreateStudentAssignmentInput = {
+  userId: Ulid
+  assignmentId: Uuid
+}
+export type CreateStudentAssignmentResult = {
+  userId: Ulid
+  assignmentId: Uuid
+  createdAt: Date
+  updatedAt: Date
+}
+
+// TODO: Make into a domain type instead
+export type StudentAssignmentCompletionRow = {
+  firstName: string
+  lastName: string
+  submittedAt?: Date
+}

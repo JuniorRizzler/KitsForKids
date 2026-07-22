@@ -1,0 +1,240 @@
+stages:
+  - build
+  - test
+  - deploy
+  - post-deploy
+
+cache:
+  key:
+    files:
+      - pnpm-lock.yaml
+  paths:
+    - .pnpm-store
+
+.node_setup:
+  image: node:24.15.0-bullseye
+  before_script:
+    - corepack enable pnpm
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+
+.build_artifact:
+  stage: build
+  extends: .node_setup
+  cache: []
+  environment:
+    action: prepare
+  artifacts:
+    when: on_success
+    paths:
+      - dist/
+  before_script:
+    - !reference [.node_setup, before_script]
+    - apt update && apt install -y curl gnupg
+    - curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh | sh
+    - export VUE_APP_GOOGLE_RECAPTCHA_KEY="$GOOGLE_RECAPTCHA_KEY"
+  script:
+    - 'echo "{\"version\": \"$CI_COMMIT_SHA-$CI_ENVIRONMENT_NAME\"}" > public/version.json'
+    - export VUE_APP_GOOGLE_RECAPTCHA_KEY="$GOOGLE_RECAPTCHA_KEY"
+    - doppler run --token $DOPPLER_TOKEN -- pnpm run build
+
+build_staging_artifact:
+  extends: .build_artifact
+  environment:
+    name: staging
+  variables:
+    DOPPLER_TOKEN: $DOPPLER_TOKEN_STAGING
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' # MR is created or updated.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+build_production_artifact:
+  extends: .build_artifact
+  environment:
+    name: production
+  variables:
+    DOPPLER_TOKEN: $DOPPLER_TOKEN_PRODUCTION
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+.deploy:
+  stage: deploy
+  image: registry.gitlab.com/static-web-apps/azure-static-web-apps-deploy
+  variables:
+    APP_PATH: '$CI_PROJECT_DIR/dist'
+    SKIP_APP_BUILD: true
+    SKIP_API_BUILD: true
+  script:
+    - echo "Deploying SWA."
+
+deploy_staging:
+  extends: .deploy
+  environment:
+    name: staging
+  resource_group: staging
+  variables:
+    API_TOKEN: $AZURE_SWA_API_TOKEN_STAGING
+  needs:
+    - job: build_staging_artifact
+      artifacts: true
+    - job: test
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+deploy_production:
+  extends: .deploy
+  environment:
+    name: production
+  resource_group: production
+  variables:
+    API_TOKEN: $AZURE_SWA_API_TOKEN_PRODUCTION
+  needs:
+    - job: build_production_artifact
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+      when: manual
+
+tag_commit_production:
+  stage: post-deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: deploy_production
+  script:
+    - echo 'Tag commit $CI_COMMIT_SHA'
+  release:
+    tag_name: 'deployed-$(date +%Y-%m-%d_%H-%M-%S)'
+    description: 'Deployed from GitLab CI.'
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+new_relic_deploy_tracker:
+  stage: post-deploy
+  needs:
+    - job: deploy_production
+  variables:
+    NEW_RELIC_DEPLOYMENT_USER_KEY: $NEW_RELIC_DEPLOYMENT_USER_KEY
+    NEW_RELIC_BROWSER_GUID_PRODUCTION: $NEW_RELIC_BROWSER_GUID_PRODUCTION
+  script: >
+    curl -v https://api.newrelic.com/graphql
+    -H 'content-type: application/json; charset=utf-8'
+    -H "API-Key: $NEW_RELIC_DEPLOYMENT_USER_KEY"
+    --data-raw '{"query":"mutation { changeTrackingCreateDeployment(deployment: {version: \"'$CI_COMMIT_SHA'\", entityGuid: \"'$NEW_RELIC_BROWSER_GUID_PRODUCTION'\"}) { deploymentId timestamp } }"}'
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+test:
+  stage: test
+  extends: .node_setup
+  before_script:
+    - !reference [.node_setup, before_script]
+    - pnpm exec playwright install --with-deps chromium
+  script:
+    - pnpm run test
+  rules:
+    - if: '$TEST_DISABLED'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' # MR is created or updated.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+e2e-test:
+  stage: test
+  extends: .node_setup
+  image: mcr.microsoft.com/playwright:v1.59.1-jammy
+  services:
+    - postgres:15.17
+    - redis:6.2.1
+  variables:
+    CI: 'true'
+    POSTGRES_HOST: postgres
+    POSTGRES_PASSWORD: Password123 # pragma: allowlist secret
+    POSTGRES_USER: admin
+    POSTGRES_DB: upchieve
+    POSTGRES_PORT: 5432
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    NODE_ENV: test_e2e_ci
+  before_script:
+    - echo 'Set up high-line...'
+    - !reference [.node_setup, before_script]
+    - echo 'Install Chrome to test against the branded browser...'
+    - pnpm exec playwright install chrome
+    - echo 'Set up subway...'
+    - git clone --depth=1 https://gitlab.com/upchieve/subway.git
+    - cd subway
+    - echo 'Subway commit version'
+    - echo $(git rev-parse HEAD)
+    # TODO: Figure out a way to cache subway node_modules.
+    - pnpm install --frozen-lockfile
+    - echo 'Verify Postgres is running and seed database...'
+    - apt-get update && apt-get install -y postgresql-client
+    - export PGPASSWORD=$POSTGRES_PASSWORD
+    - psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DB -p $POSTGRES_PORT -c "SELECT 'OK' AS status;"
+    - |
+      for file in database/db_init/{schema,auth,local_auth,test_seeds,seed_migrations}.sql; do
+        PGPASSWORD=$POSTGRES_PASSWORD psql -h postgres -U $POSTGRES_USER -d $POSTGRES_DB -f $file
+      done
+    - echo 'Verify Redis is running...'
+    - apt-get install -y redis-tools
+    - redis-cli -h $REDIS_HOST -p $REDIS_PORT PING
+    - echo 'Set environment variables we do not want defaults...'
+    - export SUBWAY_POSTGRES_HOST=$POSTGRES_HOST
+    - export SUBWAY_POSTGRES_RO_HOST=$POSTGRES_HOST
+    - export SUBWAY_POSTGRES_ANALYTICS_HOST=$POSTGRES_HOST
+    - export SUBWAY_REDIS_HOST=$REDIS_HOST
+    - export SUBWAY_SERVER_HOST=localhost:8081
+    - export VUE_APP_GOOGLE_RECAPTCHA_KEY=$GOOGLE_RECAPTCHA_KEY
+    - echo 'Start subway server...'
+    - pnpm run dev:backend > ../subway.log 2>&1 &
+    - |
+      for i in {1..30}; do
+        if curl -f http://localhost:3000/healthz 2>/dev/null; then
+          echo ' Subway is up!'
+          break
+        fi
+        if [ $i -eq 30 ]; then
+          echo 'Subway never started.'
+          exit 1
+        fi
+        echo "Attempt $i/30 to start subway. Waiting..."
+        sleep 2
+      done
+    - cd $CI_PROJECT_DIR
+    - echo 'e2e environment ready!'
+  script:
+    - pnpm run test:e2e
+  artifacts:
+    access: developer
+    when: always
+    paths:
+      - subway.log
+      - high-line.log
+      - playwright-report/
+    expire_in: 7 days
+  rules:
+    - if: '$TEST_DISABLED'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' # MR is created or updated.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+lint:
+  stage: test
+  extends: .node_setup
+  script:
+    - pnpm run lint:dry
+  rules:
+    - if: '$TEST_DISABLED'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' # MR is created or updated.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.
+
+html_validate:
+  stage: test
+  extends: .node_setup
+  script:
+    - pnpm run html-validate
+  rules:
+    - if: '$TEST_DISABLED'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' # MR is created or updated.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Committed to main.

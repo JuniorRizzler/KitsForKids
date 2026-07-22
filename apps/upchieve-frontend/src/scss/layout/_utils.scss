@@ -1,0 +1,117 @@
+@import '../setup/helpers';
+@import '../setup/breakpoints';
+
+.uc-column {
+  @include flex-container(column);
+  align-self: stretch;
+
+  &.justify-between {
+    justify-content: space-between;
+  }
+
+  &.justify-center {
+    justify-content: center;
+  }
+
+  &.justify-end {
+    justify-content: end;
+  }
+
+  &.items-center {
+    align-items: center;
+  }
+
+  &.justify-start-sm {
+    @include breakpoint-below('small') {
+      justify-content: start;
+    }
+  }
+
+  &.justify-start-md {
+    @include breakpoint-below('medium') {
+      justify-content: start;
+    }
+  }
+}
+
+.uc-row {
+  @include flex-container(row);
+
+  &.justify-end {
+    justify-content: end;
+  }
+
+  &.justify-between {
+    justify-content: space-between;
+  }
+
+  &.items-center {
+    align-items: center;
+  }
+
+  &.justify-center {
+    justify-content: center;
+  }
+
+  &.items-baseline {
+    align-items: baseline;
+  }
+
+  &.uc-column-sm {
+    @include breakpoint-below('small') {
+      flex-direction: column;
+    }
+  }
+}
+
+.flex-1 {
+  flex: 1;
+}
+
+.flex-2 {
+  flex: 2;
+}
+
+.w-full {
+  width: 100%;
+}
+
+.w-80 {
+  width: 80%;
+}
+
+.h-full {
+  height: 100%;
+}
+
+.center {
+  text-align: center;
+}
+
+.text-center {
+  text-align: center;
+}
+
+.text-start {
+  text-align: start;
+}
+
+.italic {
+  font-style: italic;
+}
+
+.overflow-hidden {
+  overflow: hidden;
+}
+
+.relative {
+  position: relative;
+}
+
+.absolute {
+  position: absolute;
+}
+
+.inline-block {
+  display: inline-block;
+}

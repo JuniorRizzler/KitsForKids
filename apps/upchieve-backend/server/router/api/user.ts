@@ -1,0 +1,400 @@
+import { Router } from 'express'
+import * as UserService from '../../services/UserService'
+import * as AwsService from '../../services/AwsService'
+import * as VolunteerService from '../../services/VolunteerService'
+import * as UserRolesService from '../../services/UserRolesService'
+import * as PresenceService from '../../services/PresenceService'
+import * as ReferralService from '../../services/ReferralService'
+import { updateUserProfile } from '../../services/UserProfileService'
+import { getUserIdByEmail, EditUserProfilePayload } from '../../models/User/'
+import { authPassport } from '../../utils/auth-utils'
+import { resError } from '../res-error'
+import {
+  asBoolean,
+  asFactory,
+  asNumber,
+  asOptional,
+  asString,
+  asUlid,
+  asArray,
+  asEnum,
+} from '../../utils/type-utils'
+import { extractUser } from '../extract-user'
+import { InputError, NotAllowedError } from '../../models/Errors'
+import { GRADES } from '../../constants'
+
+export const asEditProfilePayload = asFactory<EditUserProfilePayload>({
+  smsConsent: asOptional(asBoolean),
+  deactivated: asOptional(asBoolean),
+  mutedSubjectAlerts: asOptional(asArray(asString)),
+  phone: asOptional(asString),
+  preferredLanguage: asOptional(asString),
+  schoolId: asOptional(asString),
+  signupSourceId: asOptional(asNumber),
+  otherSignupSource: asOptional(asString),
+  gradeLevel: asOptional(asEnum(GRADES)),
+  company: asOptional(asString),
+  college: asOptional(asString),
+  occupation: asOptional(asArray(asString)),
+})
+
+export function routeUser(router: Router): void {
+  router.route('/user').get(async function (req, res) {
+    const user = extractUser(req)
+    const parsedUser = await UserService.parseUser(user.id)
+
+    res.cacheControl = { noStore: true }
+    return res.json({ user: parsedUser })
+  })
+
+  // Note: Both students and volunteers can edit parts of their profile,
+  // but only volunteers can deactivate their accounts.
+  router.put('/user', async (req, res) => {
+    try {
+      const { ip } = req
+      const user = extractUser(req)
+
+      const isDeactivated = req.body?.isDeactivated
+        ? asBoolean(req.body.isDeactivated)
+        : false
+
+      // Form request object
+      const updateReq = {
+        ...asEditProfilePayload(req.body),
+        deactivated: isDeactivated,
+        ...(req.body?.schoolId ? { schoolId: req.body?.schoolId } : {}),
+      }
+
+      if ('phone' in updateReq && updateReq.phone?.length === 0) {
+        throw new InputError("Phone number can't be empty if provided")
+      }
+
+      await updateUserProfile(user, ip, updateReq)
+
+      res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.delete('/user/phone', async (req, res) => {
+    const user = extractUser(req)
+    try {
+      await UserService.deletePhoneFromAccount(user.id)
+      res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.delete('/user', async (req, res) => {
+    try {
+      const user = extractUser(req)
+      await UserService.deleteUser(user)
+      await req.asyncLogout()
+      res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  // Admin route to update a user
+  router.put('/user/:userId', authPassport.isAdmin, async (req, res) => {
+    const { userId } = req.params
+
+    try {
+      await UserService.adminUpdateUser({ userId, ...req.body } as unknown)
+      res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.post('/user/volunteer-approval/reference', async (req, res) => {
+    try {
+      const { ip } = req
+      const user = extractUser(req)
+      await UserService.addReference({
+        userId: user.id,
+        userEmail: user.email,
+        ip,
+        ...req.body,
+      } as unknown)
+      res.sendStatus(200)
+    } catch (err) {
+      if (err instanceof NotAllowedError) {
+        res.json({
+          success: false,
+          message: err.message,
+        })
+      } else resError(res, err)
+    }
+  })
+
+  router.get('/user/volunteer-approval/photo-url', async (req, res) => {
+    try {
+      const { ip } = req
+      const user = extractUser(req)
+
+      const photoIdS3Key = await UserService.addPhotoId(user.id, ip)
+      const uploadUrl = await AwsService.getPhotoIdUploadUrl(photoIdS3Key)
+
+      if (uploadUrl) {
+        res.json({
+          success: true,
+          message: 'AWS SDK S3 pre-signed URL generated successfully',
+          uploadUrl,
+        })
+      } else {
+        res.json({
+          success: false,
+          message: 'Pre-signed URL error',
+        })
+      }
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.post(
+    '/user/volunteer-approval/background-information',
+    async (req, res) => {
+      const { ip } = req
+      const user = extractUser(req)
+
+      // TODO: duck type validation
+      const {
+        occupation,
+        experience,
+        company,
+        college,
+        linkedInUrl,
+        languages,
+        country,
+        state,
+        city,
+        phoneNumber,
+        signupSourceId,
+        otherSignupSource,
+        highSchoolId,
+        gradeLevel,
+      } = req.body
+
+      const update = {
+        occupations: occupation,
+        experience,
+        company,
+        college,
+        linkedInUrl,
+        languages,
+        country,
+        state,
+        city,
+        phoneNumber,
+        signupSourceId,
+        otherSignupSource,
+        highSchoolId,
+        gradeLevel,
+      }
+
+      try {
+        const { wasRemovedFromNTHS } =
+          await VolunteerService.submitVolunteerBackgroundInfo(
+            user.id,
+            update,
+            ip
+          )
+        res.json({ wasRemovedFromNTHS })
+      } catch (error) {
+        resError(res, error)
+      }
+    }
+  )
+
+  router.get('/user/referred-friends', async (req, res) => {
+    try {
+      const user = extractUser(req)
+      const referredFriends = await ReferralService.getReferredUsersCount(
+        user.id,
+        {
+          withPhoneOrEmailVerified: true,
+        }
+      )
+      // the frontend is expecting to look at the length of an array, not a #
+      const referredFriendsArr = Array(referredFriends)
+      res.json({ referredFriendsArr })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.get(
+    '/user/email/:userEmail',
+    authPassport.isAdmin,
+    async function (req, res) {
+      const { userEmail } = req.params
+      try {
+        const userId = (await getUserIdByEmail(userEmail))?.id
+        res.json({ userId: userId })
+      } catch (err) {
+        resError(res, err)
+      }
+    }
+  )
+
+  router.get('/user/:userId', authPassport.isAdmin, async function (req, res) {
+    const { userId } = req.params
+    const page = Number(req.query.page || '1')
+
+    const PAGE_SIZE = 10
+    const skip = PAGE_SIZE * (page - 1)
+
+    try {
+      const user = await UserService.getUserForAdminDetail(
+        asUlid(userId),
+        PAGE_SIZE,
+        skip
+      )
+      res.json({
+        ...user,
+        userType: user.roleContext.legacyRole,
+        roles: user.roleContext.roles,
+      })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.get('/users', authPassport.isAdmin, async function (req, res) {
+    try {
+      const payload = {
+        ...req.query,
+        page: req.query.page ? req.query.page : 1,
+      }
+      const { users, isLastPage } = await UserService.getUsers(
+        payload as unknown
+      )
+      res.json({ users, isLastPage })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.put('/user/roles/active', async function (req, res) {
+    try {
+      const reqUser = extractUser(req)
+      const requestedRole = req.body.activeRole
+      const { activeRole, user } = await UserService.switchActiveRoleForUser(
+        reqUser.id,
+        requestedRole
+      )
+      return res.json({ activeRole, user })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.post('/user/roles/volunteer', async function (req, res) {
+    try {
+      const user = await extractUser(req)
+      await UserRolesService.addVolunteerRoleToUser(user.id)
+      return res.sendStatus(201)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.post('/user/preferred-language', async function (req, res) {
+    try {
+      const user = await extractUser(req)
+      await UserService.updatePreferredLanguage(
+        user.id,
+        asString(req.body.preferredLanguage)
+      )
+      return res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+  router.post('/user/track-presence/active', async function (req, res) {
+    try {
+      const user = extractUser(req)
+      const ipAddress = req.ip
+      const clientUUID = req.body.clientUUID
+      await PresenceService.trackActivity({
+        userId: user.id,
+        ipAddress,
+        clientUUID,
+      })
+      return res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+  router.post('/user/track-presence/passive', async function (req, res) {
+    try {
+      const user = extractUser(req)
+      const ipAddress = req.ip
+      const clientUUID = req.body.clientUUID
+      await PresenceService.trackPassivity({
+        userId: user.id,
+        ipAddress,
+        clientUUID,
+      })
+      return res.sendStatus(200)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+  router.post(
+    '/user/track-presence/check-for-inactivity',
+    async function (req, res) {
+      try {
+        const user = extractUser(req)
+        const clientUUID = req.body.clientUUID
+        if (user.id && typeof clientUUID === 'string') {
+          PresenceService.setInactivityCountdown({
+            userId: user.id,
+            clientUUID,
+          })
+        }
+        return res.sendStatus(200)
+      } catch (err) {
+        resError(res, err)
+      }
+    }
+  )
+
+  router.put('/user/volunteer/complete-sso-signup', async function (req, res) {
+    try {
+      const user = extractUser(req)
+      if (!req.body.phone || req.body.phone.length === 0) {
+        throw new InputError('Phone number must be provided')
+      }
+      if (!req.body.signupSourceId) {
+        throw new InputError('Signup source must be provided')
+      }
+
+      const attrs: {
+        deactivated: false
+        phone: string
+        signupSourceId: number
+        otherSignupSource?: string
+      } = {
+        deactivated: false,
+        phone: req.body.phone,
+        signupSourceId: req.body.signupSourceId,
+      }
+
+      if (req.body.otherSignupSource) {
+        attrs.otherSignupSource = req.body.otherSignupSource
+      }
+
+      await updateUserProfile(user, req.ip, attrs)
+
+      return res.sendStatus(201)
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+}

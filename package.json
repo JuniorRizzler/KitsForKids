@@ -1,0 +1,13 @@
+{
+  "name": "kits-for-kids",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/demo dev",
+    "build": "pnpm --dir apps/demo build",
+    "preview": "pnpm --dir apps/demo preview",
+    "install:upstream": "pnpm --dir apps/upchieve-frontend install && pnpm --dir apps/upchieve-backend install",
+    "build:upstream": "pnpm --dir apps/upchieve-frontend build && pnpm --dir apps/upchieve-backend build"
+  },
+  "packageManager": "pnpm@11.11.0"
+}

@@ -1,0 +1,567 @@
+@use 'sass:color';
+@import '../setup/helpers';
+@import '../setup/breakpoints';
+@import '../setup/fonts';
+@import '../setup/colors';
+
+.uc-form {
+  .alert {
+    margin: 25px 0;
+  }
+}
+
+.uc-form-header {
+  font-size: 26px;
+  font-weight: 500;
+  margin: 0;
+
+  &.center {
+    text-align: center;
+  }
+}
+
+.uc-form-element {
+  @include flex-container(column);
+  margin-top: 10px;
+
+  label {
+    @include font-category(caption);
+    color: $c-secondary-grey;
+    font-weight: 400;
+    margin: 0 0 2px 4px;
+
+    &.error {
+      color: $c-error-red;
+    }
+  }
+
+  .error-caption {
+    @include font-category(caption);
+    color: $c-error-red;
+    font-weight: 400;
+    margin: 0 4px 2px 0;
+    text-align: end;
+  }
+
+  .metadata {
+    color: $c-banned-grey;
+    font-size: 12px;
+    margin: 2px 0 0 4px;
+
+    &.error {
+      color: $c-error-red;
+    }
+  }
+}
+
+.uc-form-text {
+  font-size: 14px;
+  margin: 25px 0 0 0;
+
+  &.center {
+    text-align: center;
+  }
+}
+
+.uc-link {
+  color: $c-information-blue;
+
+  &:hover {
+    color: $c-information-blue;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+}
+
+.uc-form-button {
+  background-color: $button-primary-bg;
+  border: none;
+  border-radius: 200px;
+  color: $button-primary-text;
+  font-size: 16px;
+  height: 48px;
+  margin-top: 24px;
+  width: 100%;
+  display: flex;
+  place-content: center;
+  place-items: center;
+
+  @include breakpoint-below('tiny') {
+    margin-top: 20px;
+  }
+
+  &:hover,
+  &:active {
+    background-color: $button-primary-bg-hover;
+    color: $button-primary-text;
+    text-decoration: none;
+  }
+
+  &:disabled {
+    background-color: $button-primary-bg-disabled;
+    color: $button-primary-text-disabled;
+  }
+
+  &-secondary {
+    background-color: $button-secondary-bg;
+    border: 1px solid $button-secondary-border;
+    color: $button-secondary-text;
+    border-radius: 200px;
+    font-size: 16px;
+    height: 48px;
+
+    &:hover,
+    &:active {
+      background-color: $button-secondary-bg-hover;
+      border-color: $button-secondary-border-hover;
+    }
+  }
+
+  &-back-button {
+    display: flex;
+    align-items: center;
+    font-size: 16px;
+    border-radius: 20px;
+    font-weight: 600;
+    margin-top: 24px;
+    height: 48px;
+    cursor: pointer;
+
+    &:hover {
+      background: #f7fcfe;
+    }
+  }
+
+  &.google,
+  &.sso {
+    background-color: #fff;
+    border: 1px solid $c-border-grey;
+    border-radius: 200px;
+    color: $c-secondary-grey;
+    height: 48px;
+    margin-top: 0;
+    padding: 8px;
+
+    &:hover,
+    &:active {
+      border-color: $c-information-blue;
+    }
+
+    &:disabled {
+      background-color: $button-primary-bg-disabled;
+      color: $button-primary-text-disabled;
+      border-color: $button-primary-bg-disabled;
+
+      svg {
+        opacity: 0.07;
+      }
+    }
+  }
+}
+
+// Styles for text inputs.
+.uc-form-text-input {
+  border: 1px solid $border-grey;
+  border-radius: 4px;
+  box-shadow: none;
+  box-sizing: border-box;
+  height: 48px;
+  padding: 11px 13px;
+
+  &:focus {
+    outline: 1px solid $c-information-blue;
+  }
+
+  &-invalid {
+    outline: 1px solid $c-error-red;
+  }
+
+  &::placeholder {
+    color: $c-banned-grey;
+  }
+}
+
+// Override v-select component styles.
+.v-select.uc-form-select-input {
+  box-sizing: border-box;
+  min-width: 227px;
+  width: 100%;
+
+  .vs__search {
+    margin: 0;
+    padding: 0;
+    z-index: 0;
+
+    &::placeholder {
+      color: $c-banned-grey;
+    }
+  }
+
+  &:hover {
+    .vs__dropdown-option {
+      background-color: #fff;
+    }
+  }
+
+  .vs__selected-options {
+    padding: 0;
+  }
+
+  &-invalid {
+    .vs__dropdown-toggle {
+      outline: 1px solid $c-error-red;
+    }
+  }
+
+  .vs__dropdown-toggle {
+    border: 1px solid $border-grey;
+    border-radius: 4px;
+    box-shadow: none;
+    height: 48px;
+    padding: 11px 13px;
+    width: 100%;
+  }
+
+  .vs__dropdown-toggle[aria-expanded='true'] {
+    outline: 1px solid $c-information-blue;
+  }
+
+  .vs__dropdown-menu {
+    background: #fff;
+    border: solid 1px #ccc;
+    border-top: none;
+    border-radius: 5px;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    font-size: 14px;
+    list-style: none;
+    padding: 0;
+    margin-top: 2px;
+    max-height: 180px;
+    overflow: auto;
+    width: 100%;
+  }
+
+  .vs__dropdown-option {
+    color: #000;
+    cursor: pointer;
+    padding: 10px 12px;
+    width: 100%;
+
+    &:hover,
+    &:focus {
+      background: #eee;
+      color: #000;
+    }
+  }
+}
+
+.v-select.vs--multiple.uc-form-select-input {
+  .vs__dropdown-toggle {
+    padding: 8px;
+    height: auto;
+    min-height: 48px;
+  }
+  .vs__selected-options {
+    gap: 6px;
+  }
+  .vs__selected {
+    margin: 0;
+    padding: 2px;
+    font-size: 12px;
+  }
+}
+
+.v-select.vs--single.uc-form-select-input {
+  .vs__selected {
+    margin: 0;
+    padding: 0;
+  }
+}
+
+/// Helper class for creating a basic form checkbox.
+///
+/// @example
+///   <div class="uc-form-checkbox">
+///     <input id="my-checkbox" type="checkbox" />
+///     <label for="my-checkbox">My Checkbox</label>
+///   </div>
+.uc-form-checkbox {
+  @include flex-container(row, flex-start, center);
+
+  input[type='checkbox'] {
+    @include flex-container(row, center, center);
+    $size: 20px;
+
+    -webkit-appearance: none;
+    background-color: #f6f6f6;
+    border-radius: 3px;
+    border: 1px solid #99a1a7;
+    box-shadow: none;
+
+    min-width: $size;
+    width: $size;
+    min-height: $size;
+    height: $size;
+
+    margin: 0;
+
+    &:checked {
+      background-color: white;
+      color: $c-accent;
+      font-size: 14px;
+
+      &:after {
+        content: '✔';
+      }
+    }
+  }
+
+  label {
+    font-size: 12px;
+    color: #343440;
+    margin: 0 0 0 15px;
+    text-align: left;
+
+    a {
+      color: $c-information-blue;
+    }
+  }
+}
+
+// Override autocomplete component styles.
+.uc-form-autocomplete-input {
+  width: 100%;
+
+  &-input {
+    border: 1px solid $border-grey;
+    border-radius: 4px;
+    box-shadow: none;
+    padding: 11px 13px;
+    width: 100%;
+
+    &::placeholder {
+      color: $c-banned-grey;
+    }
+
+    &:focus-within {
+      outline: 1px solid $c-information-blue;
+    }
+  }
+
+  &-invalid .uc-form-autocomplete-input-input {
+    outline: 1px solid $c-error-red;
+  }
+
+  &-result-list {
+    background: #fff;
+    border: solid 1px #ccc;
+    border-top: none;
+    border-radius: 5px;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    font-size: 14px;
+    list-style: none;
+    padding: 0;
+    margin-top: 1px;
+    max-height: 180px;
+    overflow: auto;
+    width: 100%;
+  }
+
+  [data-position='above'] .autocomplete-result-list {
+    border: solid 1px #ccc;
+    border-bottom: none;
+    border-radius: 5px;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    margin-bottom: 1px;
+    margin-top: 0;
+  }
+
+  .result {
+    cursor: pointer;
+    padding: 10px 12px;
+    width: 100%;
+
+    &:hover,
+    &:focus {
+      background: #eee;
+    }
+  }
+}
+
+.sso {
+  &-container {
+    @include flex-container(column);
+    gap: 0.75em;
+    margin-top: 1em;
+
+    @include breakpoint-above('tiny') {
+      @include flex-container(row, space-between, center);
+      flex-wrap: wrap;
+    }
+  }
+
+  &-button {
+    @include breakpoint-above('tiny') {
+      width: auto;
+      flex: 1;
+    }
+  }
+}
+
+// OLD STYLES
+.uc-form-input {
+  border: none;
+  border-bottom: 3px solid $c-accent;
+  border-radius: 0;
+  box-shadow: none;
+
+  box-sizing: content-box;
+  padding: 6px 12px;
+
+  height: 30px;
+
+  &:focus {
+    outline: none;
+    border-bottom: 3px solid color.adjust($c-accent, $lightness: -15%);
+  }
+
+  &--invalid {
+    border-bottom: 3px solid #bf0000;
+  }
+}
+
+.uc-form-button-big {
+  font-size: 14px;
+  background-color: $c-background-grey;
+  border: none;
+  border-radius: 50px;
+  color: $c-soft-black;
+  padding: 13px 32px;
+  font-weight: 500;
+  min-width: 250px;
+
+  &:hover,
+  &:active {
+    color: white;
+    background-color: $c-accent;
+  }
+
+  &:disabled {
+    background-color: #f6f6f6;
+    color: $c-secondary-grey;
+  }
+}
+
+.uc-form-subtext {
+  color: #73737a;
+  font-size: 12px;
+  margin: 6px 0 0 0;
+  text-align: left;
+}
+
+.uc-autocomplete {
+  width: 100%;
+
+  &-input {
+    border: none;
+    border-bottom: 3px solid $c-accent;
+    border-radius: 0;
+    box-shadow: none;
+
+    box-sizing: border-box;
+    padding: 6px 12px;
+
+    width: 100%;
+    height: 45px;
+
+    &:focus {
+      outline: none;
+      border-bottom: 3px solid color.adjust($c-accent, $lightness: -15%);
+    }
+  }
+
+  &-result-list {
+    width: 100%;
+    font-size: 14px;
+    background: #fff;
+    list-style: none;
+    padding: 0;
+    max-height: 180px;
+    overflow: auto;
+    border: solid 1px #ccc;
+    border-top: none;
+    border-radius: 5px;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    margin-top: 0px;
+  }
+
+  &-result {
+    width: 100%;
+    text-align: left;
+    white-space: nowrap;
+    padding: 10px 12px;
+    cursor: pointer;
+
+    &:hover,
+    &[aria-selected='true'] {
+      background: #eee;
+    }
+  }
+}
+
+.uc-form-header-link {
+  $className: &;
+
+  color: #73737a;
+  font-weight: 600;
+
+  &--active {
+    @extend #{$className};
+    color: $c-accent;
+  }
+}
+
+.uc-form-checkbox {
+  @include flex-container(row, flex-start, baseline);
+
+  label {
+    @include font-category('body');
+    color: $c-soft-black;
+    margin: 0 0 0 16px;
+  }
+
+  input[type='checkbox'] {
+    @include flex-container(row, center, center);
+    $size: 20px;
+
+    border: 1px solid $c-border-grey;
+    border-radius: 4px;
+    box-shadow: none;
+    height: $size;
+    width: $size;
+
+    &:after {
+      content: '✓';
+      opacity: 0;
+    }
+    &:checked {
+      background-color: $uc-primary-blue;
+      border-color: $uc-primary-blue;
+      color: white;
+
+      &:after {
+        opacity: 1;
+      }
+    }
+
+    &:disabled {
+      background: $c-background-grey;
+      border-color: $c-background-grey;
+      color: $c-secondary-grey;
+    }
+  }
+}

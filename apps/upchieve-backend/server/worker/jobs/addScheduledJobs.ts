@@ -1,0 +1,113 @@
+import { JobOptions as BullJobOptions } from 'bull'
+import logger from '../../logger'
+import { Jobs } from '.'
+import * as QueueService from '../../services/QueueService'
+import moment from 'moment'
+import 'moment-timezone'
+
+interface JobTemplate {
+  name: Jobs
+  data?: any
+  options?: BullJobOptions
+}
+
+export default async function addScheduledJobs() {
+  const jobTemplates: JobTemplate[] = [
+    {
+      name: Jobs.UpdateElapsedAvailability,
+      options: { repeat: { cron: '0 4 * * *', tz: 'America/New_York' } }, // each day at 4am
+    },
+    {
+      name: Jobs.EndStaleSessions,
+      options: { repeat: { cron: '0 */2 * * *' } }, // every 2 hours at minute 0
+    },
+    {
+      name: Jobs.EmailReferences,
+      options: { repeat: { cron: '*/15 * * * *' } }, // every 15 minutes
+    },
+    {
+      name: Jobs.EmailReadyToCoach,
+      options: { repeat: { cron: '30 * * * *' } }, // every hour at minute 30
+    },
+    {
+      name: Jobs.EmailReferenceFollowup,
+      options: { repeat: { cron: '0 10 * * *', tz: 'America/New_York' } }, // each day at 10am
+    },
+    {
+      name: Jobs.EmailWaitingOnReferences,
+      options: { repeat: { cron: '0 11 * * *', tz: 'America/New_York' } }, // each day at 11am
+    },
+    {
+      name: Jobs.EmailNiceToMeetYou,
+      options: { repeat: { cron: '0 10 * * *', tz: 'America/New_York' } }, // each day at 10am
+    },
+    {
+      name: Jobs.UpdateTotalVolunteerHours,
+      options: { repeat: { cron: '0 6 * * MON', tz: 'America/New_York' } }, // every Monday at 6am EST
+    },
+    {
+      name: Jobs.SpawnEmailWeeklyHourSummaryJobs,
+      options: { repeat: { cron: '0 6 * * MON', tz: 'America/New_York' } }, // every Monday at 6am EST
+    },
+    {
+      name: Jobs.EmailVolunteerInactive,
+      options: { repeat: { cron: '0 9 * * *', tz: 'America/New_York' } }, // each day at 9am
+    },
+    {
+      name: Jobs.EmailVolunteerInactiveBlackoutOver,
+      options: { repeat: { cron: '0 9 2 9 *', tz: 'America/New_York' } }, // On Septempber 2nd at 9am
+    },
+    {
+      name: Jobs.GenerateAndStoreWaitTimeHeatMap,
+      options: { repeat: { cron: '0 8 * * MON', tz: 'America/New_York' } }, // every Monday at 8am EST
+    },
+    {
+      name: Jobs.UpdateSendGridGradeLevels,
+      options: { repeat: { cron: '0 8 1 8 *', tz: 'America/New_York' } }, // On August 1st at 8am ET
+    },
+    {
+      name: Jobs.RedisKeyMemStats,
+      options: { repeat: { cron: '0 5 * * *', tz: 'America/New_York' } }, // each day at 5am
+    },
+    {
+      name: Jobs.UpdateCachedVolunteersForTextNotifications,
+      options: { repeat: { cron: '0 * * * *', tz: 'America/New_York' } }, // Every hour at minute 0
+    },
+    {
+      name: Jobs.ClearBullJobsByStatus,
+      data: { statuses: ['completed', 'failed'], timeOffsetInMs: 0 },
+      options: { repeat: { cron: '0 6 * * *', tz: 'America/New_York' } }, // each day at 6am
+    },
+    {
+      name: Jobs.SpawnUpdateNTHSChapterStatusForImpactPath,
+      data: {
+        periodStart: moment('2025-08-01').tz('America/New York').toDate(),
+        periodEnd: moment('2026-05-31').tz('America/New York').toDate(),
+      },
+      options: { repeat: { cron: '0 * * * *', tz: 'America/New York' } }, // Every hour at minute 0
+    },
+  ]
+
+  const repeatableJobs = await QueueService.queue.getRepeatableJobs()
+
+  for (const job of repeatableJobs) {
+    if (jobTemplates.find((template) => template.name === job.name)) {
+      logger.info(`Removing scheduled job: ${job.name}...`)
+      await QueueService.queue.removeRepeatableByKey(job.key)
+    }
+  }
+
+  for (const job of jobTemplates) {
+    logger.info(`Adding scheduled job ${job.name}...`)
+    await QueueService.add(
+      job.name,
+      {
+        delay: 0,
+        removeOnComplete: false,
+        removeOnFail: false,
+        ...job.options,
+      },
+      job.data
+    )
+  }
+}

@@ -1,0 +1,122 @@
+import { SUBJECTS } from '../../constants'
+import { Ulid } from '../../types/shared'
+
+export type SubjectAndTopic = {
+  subjectName: string
+  subjectId: number
+  subjectDisplayName: string
+  topicName: string
+  topicId: number
+  topicDisplayName: string
+  toolType: string
+}
+
+export type SessionWithSubjectAndTopic = {
+  sessionId: Ulid
+} & Pick<SubjectAndTopic, 'subjectName' | 'subjectId' | 'topicName' | 'topicId'>
+
+export type Topic = {
+  id: number
+  name: string
+  iconLink?: string
+  color?: string
+  dashboardOrder: number
+  displayName: string
+  createdAt: Date
+  updatedAt: Date
+  trainingOrder: number
+}
+
+export type GetTopicsResult = Pick<
+  Topic,
+  | 'id'
+  | 'name'
+  | 'displayName'
+  | 'iconLink'
+  | 'dashboardOrder'
+  | 'trainingOrder'
+>
+
+export type SubjectWithTopic = {
+  name: string
+  id: number
+  displayOrder: number
+  displayName: string
+  active: boolean
+  topicId: number
+  topicName: string
+  topicDisplayName: string
+  topicDashboardOrder: number
+  isComputedUnlock: boolean
+  topicIconLink?: string
+  topicColor?: string
+  // For an alias subject (no quiz of its own), the quiz it reuses (e.g. apChemistry -> chemistry).
+  unlockQuizName?: string
+}
+
+export type AllSubjectsWithTopics = { [subject: string]: SubjectWithTopic }
+
+export type TrainingItem = {
+  key: string
+  displayName: string
+  active?: boolean
+}
+
+export type TrainingItemWithOrder = TrainingItem & {
+  order: number
+}
+
+export type TrainingRow = TrainingItemWithOrder & {
+  subjectsIncluded: TrainingItemWithOrder[]
+}
+
+export type TrainingRowPerTopic = {
+  [topicName: string]: TrainingRow[]
+}
+
+export type TrainingPerTopic = {
+  training: TrainingItem[]
+  certifications: TrainingRow[]
+  additionalSubjects: TrainingRow[]
+  computedSubjects?: TrainingRow[]
+}
+
+export type TrainingView = {
+  subjectTypes: TrainingItemWithOrder[]
+} & { [topicName: string]: TrainingPerTopic }
+
+export type FormattedTrainingRowMapping = {
+  rowName: string
+  rowDisplayName: string
+  rowDisplayOrder: number
+  rowListItemName: string
+  rowListItemDisplayName: string
+  rowListItemDisplayOrder: number
+  rowIsActive?: boolean
+}
+
+export type FormattedTrainingRowMappingToKeyOf<T> = {
+  rowName: keyof T
+  rowDisplayName: keyof T
+  rowDisplayOrder: keyof T
+  rowIsActive?: keyof T
+  rowListItemName: keyof T
+  rowListItemDisplayName: keyof T
+  rowListItemDisplayOrder: keyof T
+}
+
+export type FormattedTrainingPerTopic = {
+  [topicName: string]: FormattedTrainingRowMapping[]
+}
+
+export type FormattedTrainingRowMappingPerTopic<T> = {
+  [topicName: string]: T[]
+}
+
+export type TrainingCourses = {
+  id: number
+  name: string
+  displayName: string
+}
+
+export type ComputedSubjectUnlocks = Record<SUBJECTS, SUBJECTS[]>

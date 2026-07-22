@@ -1,0 +1,131 @@
+// This file is imported in App.vue.
+@use 'sass:meta';
+@use 'sass:color';
+
+// TODO: Figure out what styles we are relying on from bootstrap and remove.
+@use 'bootstrap/scss/bootstrap';
+
+@include meta.load-css('~/typeface-work-sans/index.css');
+@include meta.load-css('~/vue-select/dist/vue-select.css');
+
+@include meta.load-css('maz-ui/css/main.css');
+@include meta.load-css('~/quill/dist/quill.core.css');
+@include meta.load-css('~/quill/dist/quill.snow.css');
+@include meta.load-css('vue-draggable-resizable/style.css');
+
+/* Core CSS required for Ionic components to work properly */
+@include meta.load-css('~/@ionic/vue/css/core.css');
+
+@include meta.load-css('vuetify/styles');
+
+@include meta.load-css('layout/utils');
+@include meta.load-css('layout/form');
+@include meta.load-css('layout/modal');
+@include meta.load-css('layout/spacing');
+@include meta.load-css('layout/training');
+@include meta.load-css('layout/vuetify-overrides');
+
+html.plt-mobile ion-app,
+ion-app {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+}
+
+*,
+::before,
+::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  background: $c-background-grey;
+  color: $c-soft-black;
+
+  font-family: $font-family-default;
+  font-display: swap;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  height: 100%;
+}
+
+button {
+  background-color: transparent;
+  border-width: 0;
+  border-style: solid;
+}
+
+button,
+input,
+optgroup,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 1em;
+  line-height: 1.15;
+  margin: 0;
+}
+
+#mount {
+  height: 100%;
+}
+
+.disable-scroll {
+  overflow: hidden;
+}
+
+// Hides the Google reCAPTCHA badge.
+// However, any flow that uses reCAPTCHA must have branding visible in the user flow.
+// See https://developers.google.com/recaptcha/docs/faq#id-like-to-hide-the-recaptcha-badge.-what-is-allowed
+.grecaptcha-badge {
+  visibility: hidden;
+}
+
+// from _overrides.scss
+.v-select {
+  .vs__dropdown-toggle {
+    padding: 5px 9px 9px 6px;
+  }
+}
+
+// maz-phone-number-input overrides
+.maz-border-success {
+  border-color: #16ba97;
+}
+
+.maz-text-success-600 {
+  color: #16ba97;
+}
+
+.profile #VuePhoneNumberInput_phone_number {
+  margin-left: -1px !important;
+}
+
+// Allow the Quill Doc to scroll.
+.ql-container {
+  overflow: auto;
+}
+
+// _fonts.scss
+.light-bold {
+  font-weight: 500;
+}
+
+.bold {
+  font-weight: 600;
+}
+
+// Override Ionic colors
+:root {
+  --ion-color-success: #{color.adjust($c-success-green, $lightness: 50%)};
+}
+
+.ion-color-sucess {
+  --ion-color-base: var(--ion-color-success);
+}

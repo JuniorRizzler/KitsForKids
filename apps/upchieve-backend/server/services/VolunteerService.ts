@@ -1,0 +1,557 @@
+import {
+  ACCOUNT_USER_ACTIONS,
+  EVENTS,
+  GRADES,
+  PHOTO_ID_STATUS,
+  STATUS,
+  TRAINING_QUIZZES,
+} from '../constants'
+import { Ulid, Uuid } from '../models/pgUtils'
+import { createAccountAction } from '../models/UserAction'
+import * as VolunteerRepo from '../models/Volunteer'
+import * as UsersSchoolsRepo from '../models/UsersSchools'
+import * as UsersGradeLevelRepo from '../models/UsersGradeLevels'
+import { Jobs } from '../worker/jobs'
+import * as AnalyticsService from './AnalyticsService'
+import * as NTHSService from './NTHSGroupsService'
+import { getTotalElapsedAvailabilityForDateRange } from './AvailabilityService'
+import * as MailService from './MailService'
+import * as ReferralService from './ReferralService'
+import QueueService from './QueueService'
+import { getTimeTutoredForDateRange } from './SessionService'
+import { getQuizzesPassedForDateRangeById } from '../models/UserAction'
+import { getClient, runInTransaction, TransactionClient } from '../db'
+import {
+  Sponsorship,
+  TextableVolunteer,
+  VolunteerForOnboarding,
+  VolunteerOccupations,
+  VolunteerProfileUpdate,
+  VolunteerWithReadyToCoachInfo,
+} from '../models/Volunteer'
+import * as cache from '../cache'
+import { getSubjectsWithTopic } from './SubjectsService'
+import logger from '../logger'
+import { isHighSchoolGrade } from '../utils/grade-levels'
+import { daysInMs } from '../utils/time-utils'
+
+export interface HourSummaryStats {
+  totalCoachingHours: number
+  totalQuizzesPassed: number
+  totalElapsedAvailability: number
+  totalVolunteerHours: number
+  totalReferralMinutes: number
+}
+
+export type VolunteerSubjectPresenceMap = { [subjectName: string]: number }
+
+type VolunteerSubjectProfile = {
+  userId: Uuid
+  activeSubjects: string[]
+  mutedSubjects: string[]
+}
+
+export const VOLUNTEER_MINUTES_EARNED_PER_REFERRAL = 12
+
+export async function totalReferralMinutes(volunteerId: string) {
+  const totalReferredVolunteers = Number(
+    await ReferralService.getReferredUsersCount(volunteerId)
+  )
+  return totalReferredVolunteers * VOLUNTEER_MINUTES_EARNED_PER_REFERRAL
+}
+
+export async function getHourSummaryStats(
+  volunteerId: Uuid,
+  fromDate: Date,
+  toDate: Date
+): Promise<HourSummaryStats> {
+  // TODO: promise.all fails fast, do we want this? - handle error?
+  const [quizzesPassed, elapsedAvailability, timeTutoredMS] = await Promise.all(
+    [
+      getQuizzesPassedForDateRangeById(volunteerId, fromDate, toDate),
+      getTotalElapsedAvailabilityForDateRange(volunteerId, fromDate, toDate),
+      getTimeTutoredForDateRange(volunteerId, fromDate, toDate),
+    ]
+  )
+  logger.info(
+    {
+      volunteerId,
+      quizzesPassed,
+      elapsedAvailability,
+      timeTutoredMS,
+      startDate: fromDate,
+      endDate: toDate,
+    },
+    'Calculating volunteer hourly summay stats'
+  )
+
+  const timeTutoredInHours = Number(timeTutoredMS / 3600000).toFixed(2)
+  const totalCoachingHours = Number(timeTutoredInHours)
+  // Total volunteer hours calculation: [sum of coaching, elapsed avail/10, and quizzes]
+  const totalVolunteerHours = Number(
+    (
+      totalCoachingHours +
+      quizzesPassed +
+      Number(elapsedAvailability) * 0.1
+    ).toFixed(2)
+  )
+
+  return {
+    totalCoachingHours,
+    totalQuizzesPassed: quizzesPassed,
+    totalElapsedAvailability: elapsedAvailability,
+    totalVolunteerHours: totalVolunteerHours,
+    totalReferralMinutes: await totalReferralMinutes(volunteerId),
+  }
+}
+
+export async function queueOnboardingReminderOneEmail(
+  volunteerId: Uuid
+): Promise<void> {
+  await QueueService.add(
+    Jobs.EmailOnboardingReminderOne,
+    { delay: daysInMs(7) },
+    {
+      volunteerId,
+    }
+  )
+}
+
+export async function queueOnboardingEventEmails(
+  volunteerId: Uuid,
+  isPartnerVolunteer: boolean = false
+): Promise<void> {
+  await QueueService.add(
+    Jobs.EmailVolunteerQuickTips,
+    { delay: daysInMs(5) },
+    { volunteerId }
+  )
+  if (isPartnerVolunteer) {
+    await QueueService.add(
+      Jobs.EmailPartnerVolunteerLowHoursSelected,
+      { delay: daysInMs(10) },
+      { volunteerId }
+    )
+  }
+}
+
+export async function queueFailedFirstAttemptedQuizEmail(
+  category: string,
+  email: string,
+  firstName: string,
+  volunteerId: Uuid
+) {
+  await QueueService.add(
+    Jobs.EmailFailedFirstAttemptedQuiz,
+    { delay: 0 },
+    {
+      category,
+      email,
+      firstName,
+      volunteerId,
+    }
+  )
+}
+
+export async function getVolunteersToReview(page: number = 1): Promise<{
+  volunteers: any[]
+  isLastPage: boolean
+}> {
+  const pageNum = page
+  const PER_PAGE = 15
+  const skip = (pageNum - 1) * PER_PAGE
+
+  try {
+    // Replaced by VolunteerRepo.getVolunteersToReview
+    const volunteers = await VolunteerRepo.getVolunteersToReview(PER_PAGE, skip)
+
+    const isLastPage = volunteers.length < PER_PAGE
+    return { volunteers, isLastPage }
+  } catch (error) {
+    throw new Error((error as Error).message)
+  }
+}
+
+export function getPendingVolunteerApprovalStatus(
+  photoIdStatus: string,
+  hasCompletedBackgroundInfo: boolean
+) {
+  return photoIdStatus === STATUS.APPROVED && hasCompletedBackgroundInfo
+}
+
+export async function updatePendingVolunteerStatus(
+  volunteerId: Uuid,
+  photoIdStatus: string
+): Promise<void> {
+  const volunteerBeforeUpdate =
+    await VolunteerRepo.getVolunteerForPendingStatus(volunteerId)
+  if (!volunteerBeforeUpdate) return
+
+  const hasCompletedBackgroundInfo =
+    volunteerBeforeUpdate.occupations &&
+    volunteerBeforeUpdate.occupations.length > 0 &&
+    volunteerBeforeUpdate.country
+      ? true
+      : false
+  // A volunteer must have the following list items approved before being considered an approved volunteer
+  // 1. photo id
+  // 2. completed background information
+  const isApproved = getPendingVolunteerApprovalStatus(
+    photoIdStatus,
+    hasCompletedBackgroundInfo
+  )
+
+  await VolunteerRepo.updateVolunteerPending(
+    volunteerId,
+    isApproved,
+    photoIdStatus
+  )
+
+  if (
+    photoIdStatus === PHOTO_ID_STATUS.REJECTED &&
+    volunteerBeforeUpdate.photoIdStatus !== PHOTO_ID_STATUS.REJECTED
+  ) {
+    await createAccountAction({
+      userId: volunteerId,
+      action: ACCOUNT_USER_ACTIONS.REJECTED_PHOTO_ID,
+    })
+    AnalyticsService.captureEvent(volunteerId, EVENTS.PHOTO_ID_REJECTED, {
+      event: EVENTS.PHOTO_ID_REJECTED,
+    })
+    MailService.sendRejectedPhotoSubmission(volunteerBeforeUpdate)
+  }
+
+  const isNewlyApproved = isApproved && !volunteerBeforeUpdate.approved
+  if (isNewlyApproved) {
+    await createAccountAction({
+      userId: volunteerId,
+      action: ACCOUNT_USER_ACTIONS.APPROVED,
+    })
+    AnalyticsService.captureEvent(volunteerId, EVENTS.ACCOUNT_APPROVED, {
+      event: EVENTS.ACCOUNT_APPROVED,
+    })
+
+    if (volunteerBeforeUpdate.onboarded) {
+      AnalyticsService.captureEvent(volunteerId, EVENTS.ACCOUNT_VOLUNTEER_READY)
+    }
+  }
+  if (isNewlyApproved && !volunteerBeforeUpdate.onboarded)
+    MailService.sendApprovedNotOnboardedEmail(volunteerBeforeUpdate)
+}
+
+export async function submitVolunteerBackgroundInfo(
+  userId: Ulid,
+  update: VolunteerProfileUpdate & {
+    phoneNumber?: string
+    signupSourceId?: number
+    otherSignupSource?: string
+    highSchoolId?: Ulid | null
+  },
+  ip?: string
+) {
+  const volunteer = await VolunteerRepo.getVolunteerContactInfoById(userId)
+  if (!volunteer) throw new Error('Volunteer for background info not found')
+  const isPartnerVolunteer = !!volunteer.volunteerPartnerOrg
+  const nthsGroups = await NTHSService.getNTHSGroupsByMember(userId)
+  let wasRemovedFromNTHS = false
+
+  await runInTransaction(async (tc) => {
+    if (isPartnerVolunteer && !volunteer.approved) {
+      await VolunteerRepo.updateVolunteerApproved(userId, true, tc)
+      await createAccountAction(
+        {
+          userId,
+          action: ACCOUNT_USER_ACTIONS.APPROVED,
+          ipAddress: ip,
+        },
+        tc
+      )
+    }
+    if (update.occupations) {
+      await VolunteerRepo.deleteVolunteerOccupations(userId, tc)
+      await VolunteerRepo.insertVolunteerOccupations(
+        userId,
+        update.occupations,
+        tc
+      )
+    }
+    await VolunteerRepo.updateVolunteerProfile(
+      userId,
+      {
+        experience: update.experience,
+        company: update.company,
+        college: update.college,
+        linkedInUrl: update.linkedInUrl,
+        country: update.country,
+        state: update.state,
+        city: update.city,
+        languages: update.languages,
+      },
+      tc
+    )
+    await VolunteerRepo.updateSsoUserBackgroundInfo(
+      userId,
+      {
+        // @TODO: Update client to send these as nulls, not empty strings ''
+        phone: update.phoneNumber || null,
+        signupSourceId: update.signupSourceId || null,
+        otherSignupSource: update.otherSignupSource || null,
+      },
+      tc
+    )
+
+    if (update.highSchoolId) {
+      await UsersSchoolsRepo.upsertUsersSchool(
+        userId,
+        update.highSchoolId,
+        'student_at_school',
+        tc
+      )
+    }
+    if (nthsGroups.length && update.occupations && update.occupations.length) {
+      // NTHS members have to be high schoolers. If this user is part of any NTHS chapters, and they are not in high school,
+      // they must be removed from the group immediately.
+      if (
+        !update.occupations.includes(
+          VolunteerOccupations.HIGH_SCHOOL_STUDENT
+        ) ||
+        !update.gradeLevel ||
+        !isHighSchoolGrade(update.gradeLevel)
+      ) {
+        wasRemovedFromNTHS = true
+        await NTHSService.deactivateNonHighSchoolMember(userId, nthsGroups, tc)
+      }
+    }
+
+    if (update.gradeLevel) {
+      await UsersGradeLevelRepo.upsertUserGradeLevel(
+        userId,
+        update.gradeLevel,
+        tc
+      )
+    } else if (
+      update.occupations?.includes(VolunteerOccupations.UNDERGRAD_STUDENT)
+    ) {
+      await UsersGradeLevelRepo.upsertUserGradeLevel(userId, GRADES.COLLEGE, tc)
+    }
+
+    await createAccountAction(
+      {
+        userId,
+        action: ACCOUNT_USER_ACTIONS.COMPLETED_BACKGROUND_INFO,
+        ipAddress: ip,
+      },
+      tc
+    )
+  })
+
+  return { wasRemovedFromNTHS }
+}
+
+/**
+ * Onboard the volunteer if they were not previously onboarded, but they have now met the requirements.
+ *
+ * @param volunteerId - The volunteer to onboard
+ * @param ip - The IP address of the volunteer
+ * @param tc - Client to run db transaction on
+ */
+export async function onboardVolunteer(
+  volunteerId: Uuid,
+  ip: string = '',
+  tc: TransactionClient
+): Promise<void> {
+  const volunteer = await getVolunteerForOnboardingById(volunteerId, true, tc)
+  if (!volunteer) {
+    // If there is no volunteer, means they've already been onboarded.
+    return
+  }
+  const isReadyToOnboard =
+    volunteer.subjects.length && volunteer.hasCompletedUpchieve101
+  if (isReadyToOnboard) {
+    await VolunteerRepo.updateVolunteerOnboarded(volunteer.id, tc)
+    await queueOnboardingEventEmails(
+      volunteer.id,
+      !!volunteer.volunteerPartnerOrgKey
+    )
+    await createAccountAction(
+      {
+        action: ACCOUNT_USER_ACTIONS.ONBOARDED,
+        userId: volunteer.id,
+        ipAddress: ip,
+      },
+      tc
+    )
+    AnalyticsService.captureEvent(volunteer.id, EVENTS.ACCOUNT_ONBOARDED, {
+      event: EVENTS.ACCOUNT_ONBOARDED,
+    })
+
+    if (volunteer.approved) {
+      AnalyticsService.captureEvent(volunteerId, EVENTS.ACCOUNT_VOLUNTEER_READY)
+    }
+  }
+}
+
+export async function getActiveSponsorshipsByUserId(
+  userId: Uuid
+): Promise<Sponsorship[]> {
+  return VolunteerRepo.getActiveSponsorshipsByUserId(userId)
+}
+
+function getVolunteerSubjectPresenceCacheKey(subject: string) {
+  return `online:subject:${subject}`
+}
+
+async function getVolunteerSubjectProfile(
+  userId: Uuid
+): Promise<VolunteerSubjectProfile | undefined> {
+  const subjectsResult = await VolunteerRepo.getVolunteerSubjects(userId)
+  const mutedSubjectsResult =
+    await VolunteerRepo.getVolunteerMutedSubjects(userId)
+
+  const subjects: string[] = []
+  const activeSubjects: string[] = []
+  for (const { name, active } of subjectsResult) {
+    subjects.push(name)
+    if (active) activeSubjects.push(name)
+  }
+
+  const mutedSubjects = mutedSubjectsResult.map(({ name }) => name)
+  return {
+    userId,
+    activeSubjects,
+    mutedSubjects,
+  }
+}
+
+export async function updateVolunteerSubjectPresence(
+  userId: Uuid,
+  action: 'add' | 'remove'
+): Promise<void> {
+  const subjectProfile = await getVolunteerSubjectProfile(userId)
+  if (!subjectProfile) return
+
+  const activeSubjects = subjectProfile.activeSubjects.filter(
+    (subject) => !subjectProfile.mutedSubjects.includes(subject)
+  )
+  if (activeSubjects.length === 0) return
+
+  const promises = activeSubjects.map((subject) => {
+    const key = getVolunteerSubjectPresenceCacheKey(subject)
+    return action === 'add'
+      ? cache.sadd(key, userId)
+      : cache.removeFromSet(key, userId)
+  })
+  await Promise.all(promises)
+}
+
+export async function getSubjectPresence(): Promise<VolunteerSubjectPresenceMap> {
+  const allSubjects = await getSubjectsWithTopic()
+  const subjectPresenceMap: VolunteerSubjectPresenceMap = {}
+
+  for (const subject of Object.values(allSubjects)) {
+    const key = getVolunteerSubjectPresenceCacheKey(subject.name)
+    const count = await cache.getSetSize(key)
+    subjectPresenceMap[subject.name] = count
+  }
+
+  return subjectPresenceMap
+}
+
+export async function queueNationalTutorCertificateEmail(
+  volunteerId: Uuid
+): Promise<void> {
+  await QueueService.add(
+    Jobs.SendNationalTutorCertificateEmail,
+    { delay: 0 },
+    {
+      volunteerId,
+    }
+  )
+}
+
+export async function getVolunteersForTextNotifications(): Promise<
+  TextableVolunteer[]
+> {
+  return await VolunteerRepo.getVolunteersForTextNotifications()
+}
+
+export async function getVolunteerForOnboardingById(
+  userId: Ulid,
+  includeDeactivatedUsers = false,
+  tc: TransactionClient = getClient()
+): Promise<VolunteerForOnboarding | undefined> {
+  const volunteer = await VolunteerRepo.getVolunteerForOnboardingById(
+    tc,
+    userId,
+    { includeDeactivated: includeDeactivatedUsers }
+  )
+  if (volunteer) {
+    const completedVolunteerTraining =
+      await hasCompletedVolunteerTraining(userId)
+    return {
+      ...volunteer,
+      hasCompletedUpchieve101: completedVolunteerTraining,
+    }
+  }
+}
+
+export async function hasCompletedVolunteerTraining(
+  userId: Ulid,
+  tc: TransactionClient = getClient()
+): Promise<boolean> {
+  // Case 1: Passed the legacy training quiz
+  const userQuizzes = (
+    await VolunteerRepo.getQuizzesForVolunteers([userId], tc)
+  )[userId]
+  const passedLegacyQuiz =
+    userQuizzes[TRAINING_QUIZZES.LEGACY_UPCHIEVE_101]?.passed
+  if (passedLegacyQuiz) return passedLegacyQuiz
+
+  // Case 2: Got all the new training certifications
+  const userCertifications = (
+    await VolunteerRepo.getCertificationsForVolunteer([userId], tc)
+  )[userId]
+
+  const safetyCert = userCertifications.hasOwnProperty(
+    TRAINING_QUIZZES.COMMUNITY_SAFETY
+  )
+    ? userCertifications[TRAINING_QUIZZES.COMMUNITY_SAFETY]
+    : null
+  const academicIntegrityCert = userCertifications.hasOwnProperty(
+    TRAINING_QUIZZES.ACADEMIC_INTEGRITY
+  )
+    ? userCertifications[TRAINING_QUIZZES.ACADEMIC_INTEGRITY]
+    : null
+  const deiCert = userCertifications.hasOwnProperty(TRAINING_QUIZZES.DEI)
+    ? userCertifications[TRAINING_QUIZZES.DEI]
+    : null
+  const coachingStrategiesCert = userCertifications.hasOwnProperty(
+    TRAINING_QUIZZES.COACHING_STRATEGIES
+  )
+    ? userCertifications[TRAINING_QUIZZES.COACHING_STRATEGIES]
+    : null
+  const completedTraining =
+    (safetyCert?.passed &&
+      academicIntegrityCert?.passed &&
+      deiCert?.passed &&
+      coachingStrategiesCert?.passed) ||
+    false
+  return completedTraining
+}
+
+export async function doesVolunteerWithEmailExist(email: string) {
+  return VolunteerRepo.doesVolunteerWithEmailExist(email)
+}
+
+export async function getVolunteersReadyToCoachStatus(
+  volunteerIds: Ulid[]
+): Promise<VolunteerWithReadyToCoachInfo[]> {
+  const volunteers =
+    await VolunteerRepo.getVolunteersReadyToCoachStatus(volunteerIds)
+  return volunteers.map((vol) => {
+    return {
+      ...vol,
+      isReadyToCoach: vol.isApproved && vol.isOnboarded,
+    }
+  })
+}

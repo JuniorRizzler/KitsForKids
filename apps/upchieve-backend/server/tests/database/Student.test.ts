@@ -1,0 +1,414 @@
+/**
+ * @group database/parallel
+ */
+
+import {
+  addStudentsToTeacherClass,
+  adminUpdateStudentUser,
+  getFavoritedVolunteerIdsFromList,
+  getStudentContactInfoById,
+  upsertStudentProfile,
+} from '../../models/Student/queries'
+import { faker } from '@faker-js/faker'
+import { CreateUserPayload } from '../../models/User'
+import { getClient } from '../../db'
+import { getDbUlid, makeSomeRequired, Ulid } from '../../models/pgUtils'
+import {
+  createTestStudent,
+  createTestUser,
+  createTestVolunteer,
+} from './seed-utils'
+import { insertSingleRow } from '../db-utils'
+
+const client = getClient()
+
+test('Make a connection', async () => {
+  const result = await getStudentContactInfoById(getDbUlid())
+  expect(result).toBeUndefined()
+})
+
+describe('upsertStudentProfile', () => {
+  test('creates the student if did not exist', async () => {
+    const user = await createUser()
+    const student = {
+      userId: user.id,
+    }
+
+    const before = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(before.rows.length).toBe(0)
+
+    const returned = await upsertStudentProfile(student, client)
+    expect(returned.isCreated).toBe(true)
+
+    const after = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(after.rows.length).toBe(1)
+  })
+
+  test('updates the student if did exist', async () => {
+    const user = await createUser()
+    const student = {
+      userId: user.id,
+    }
+    await client.query('INSERT INTO student_profiles (user_id) VALUES($1)', [
+      user.id,
+    ])
+
+    const before = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(before.rows.length).toBe(1)
+
+    const COLLEGE_MENTORS_SPO_ID = '01919662-87dc-1b9c-e053-326c64a2edbc'
+    const COLLEGE_MENTORS_SPO_SITE_ID = '01919662-87f5-aa97-e107-b2e537409c85'
+    const updatedStudent = {
+      ...student,
+      zipCode: '00000',
+      schoolId: '01919662-87fb-76b3-54f8-db306e73e181',
+      studentPartnerOrgKey: 'college-mentors',
+      studentPartnerOrgSiteName: 'Brooklyn',
+    }
+
+    const returned = await upsertStudentProfile(updatedStudent, client)
+    expect(returned.isCreated).toBe(false)
+
+    const after = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(after.rows.length).toBe(1)
+    expect(after.rows[0].postal_code).toBe(updatedStudent.zipCode)
+    expect(after.rows[0].school_id).toBe(updatedStudent.schoolId)
+    expect(after.rows[0].student_partner_org_id).toBe(COLLEGE_MENTORS_SPO_ID)
+    expect(after.rows[0].student_partner_org_site_id).toBe(
+      COLLEGE_MENTORS_SPO_SITE_ID
+    )
+  })
+
+  test('updates only the values that are new, except partner site', async () => {
+    const user = await createUser()
+
+    const COLLEGE_MENTORS_SPO_ID = '01919662-87dc-1b9c-e053-326c64a2edbc'
+    const COLLEGE_MENTORS_SPO_SITE_ID = '01919662-87f5-ff78-938f-0a96942eb02f'
+    const UNAPPROVED_SCHOOL_ID = '01919662-87fb-9261-542c-58cbced78fc3'
+    await client.query(
+      'INSERT INTO student_profiles (user_id, postal_code, student_partner_org_id, student_partner_org_site_id, school_id, college, created_at, updated_at) VALUES($1, $2, $3, $4, $5, $6, $7, $8)',
+      [
+        user.id,
+        '00000',
+        COLLEGE_MENTORS_SPO_ID,
+        COLLEGE_MENTORS_SPO_SITE_ID,
+        UNAPPROVED_SCHOOL_ID,
+        'some college',
+        new Date(),
+        new Date(),
+      ]
+    )
+    const before = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(before.rows.length).toBe(1)
+
+    const returnedNoUpdate = await upsertStudentProfile(
+      { userId: user.id },
+      client
+    )
+    expect(returnedNoUpdate.isCreated).toBe(false)
+
+    const afterNoUpdate = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(afterNoUpdate.rows.length).toBe(1)
+    expect(afterNoUpdate.rows[0].postal_code).toBe('00000')
+    expect(afterNoUpdate.rows[0].school_id).toBe(UNAPPROVED_SCHOOL_ID)
+    expect(afterNoUpdate.rows[0].student_partner_org_id).toBe(
+      COLLEGE_MENTORS_SPO_ID
+    )
+    expect(afterNoUpdate.rows[0].student_partner_org_site_id).toBe(
+      COLLEGE_MENTORS_SPO_SITE_ID
+    )
+
+    const updatedStudent = {
+      userId: user.id,
+      studentPartnerOrgKey: 'school-helpers',
+    }
+    const returnedWithUpdate = await upsertStudentProfile(
+      updatedStudent,
+      client
+    )
+    expect(returnedWithUpdate.isCreated).toBe(false)
+
+    const afterWithUpdate = await client.query(
+      'SELECT * FROM student_profiles WHERE user_id = $1',
+      [user.id]
+    )
+    expect(afterWithUpdate.rows.length).toBe(1)
+    expect(afterWithUpdate.rows[0].student_partner_org_id).toBe(
+      '01919662-87dc-5824-8bf6-e5e408bf6f40'
+    )
+    expect(afterWithUpdate.rows[0].student_partner_org_site_id).toBeNull()
+  })
+})
+
+describe('addStudentsToTeacherClass', () => {
+  test('adds multiple students to the class', async () => {
+    const u1 = (
+      await client.query(
+        'INSERT INTO student_profiles (user_id) VALUES ($1) RETURNING user_id',
+        [(await createUser()).id]
+      )
+    ).rows[0].user_id
+    const u2 = (
+      await client.query(
+        'INSERT INTO student_profiles (user_id) VALUES ($1) RETURNING user_id',
+        [(await createUser()).id]
+      )
+    ).rows[0].user_id
+    const u3 = (
+      await client.query(
+        'INSERT INTO student_profiles (user_id) VALUES ($1) RETURNING user_id',
+        [(await createUser()).id]
+      )
+    ).rows[0].user_id
+
+    const c = await createTeacherClass()
+
+    await addStudentsToTeacherClass([u1, u2, u3], c.id, client)
+
+    const actual = await client.query(
+      'SELECT * FROM student_classes WHERE class_id = $1',
+      [c.id]
+    )
+    expect(actual.rows.length).toBe(3)
+    const actualUserIds = new Set(actual.rows.map((r) => r.user_id))
+    expect(actualUserIds.has(u1)).toBe(true)
+    expect(actualUserIds.has(u2)).toBe(true)
+    expect(actualUserIds.has(u3)).toBe(true)
+  })
+
+  test('does not throw error if student ids array is empty', async () => {
+    const c = await createTeacherClass()
+
+    await addStudentsToTeacherClass([], c.id, client)
+
+    const actual = await client.query(
+      'SELECT * FROM student_classes WHERE class_id = $1',
+      [c.id]
+    )
+    expect(actual.rows.length).toBe(0)
+  })
+
+  describe('getFavoritedVolunteerIdsFromList', () => {
+    test("returns a list of the student's actually favorited volunteers from a list", async () => {
+      const studentId = (await createTestStudent(getClient())).user_id
+      const fav1 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), fav1)
+      const fav2 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), fav2)
+      const fav3 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), fav3)
+      const notFav1 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), notFav1)
+      const notFav2 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), notFav2)
+      const notFav3 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), notFav3)
+      const notFav4 = (await createTestUser(getClient())).id
+      await createTestVolunteer(getClient(), notFav4)
+      await insertSingleRow(
+        'student_favorite_volunteers',
+        { studentId, volunteerId: fav1 },
+        getClient()
+      )
+      await insertSingleRow(
+        'student_favorite_volunteers',
+        { studentId, volunteerId: fav2 },
+        getClient()
+      )
+      await insertSingleRow(
+        'student_favorite_volunteers',
+        { studentId, volunteerId: fav3 },
+        getClient()
+      )
+
+      const result = await getFavoritedVolunteerIdsFromList(studentId, [
+        fav1,
+        fav2,
+        fav3,
+        notFav1,
+        notFav2,
+        notFav3,
+        notFav4,
+      ])
+
+      expect(result).toContain(fav1)
+      expect(result).toContain(fav2)
+      expect(result).toContain(fav3)
+      expect(result).not.toContain(notFav1)
+      expect(result).not.toContain(notFav2)
+      expect(result).not.toContain(notFav3)
+      expect(result).not.toContain(notFav4)
+    })
+  })
+})
+
+describe('adminUpdateStudentUser', () => {
+  it('Updates the expected fields', async () => {
+    const { id: userId } = await createUser({
+      email: faker.internet.email(),
+      firstName: faker.person.firstName(),
+      lastName: faker.person.lastName(),
+    })
+    const originalUser = makeSomeRequired(
+      (await client.query(`SELECT * FROM users WHERE id = $1`, [userId]))
+        .rows[0],
+      [
+        'id',
+        'email',
+        'firstName',
+        'lastName',
+        'emailVerified',
+        'verified',
+        'deactivated',
+      ]
+    )
+    await adminUpdateStudentUser(
+      userId,
+      {
+        email: faker.internet.email(),
+        verified: true,
+        banType: 'complete',
+        deactivated: true,
+      },
+      client
+    )
+    const updatedUser = makeSomeRequired(
+      (await client.query(`SELECT * FROM users WHERE id = $1`, [userId]))
+        .rows[0],
+      [
+        'id',
+        'email',
+        'firstName',
+        'lastName',
+        'emailVerified',
+        'verified',
+        'deactivated',
+      ]
+    )
+    expect(originalUser.id).toEqual(updatedUser.id)
+    expect(originalUser.email).not.toEqual(updatedUser.email)
+    expect(originalUser.firstName).toEqual(updatedUser.firstName)
+    expect(originalUser.lastName).toEqual(updatedUser.lastName)
+    expect(originalUser.verified).not.toEqual(updatedUser.verified)
+    expect(originalUser.banType).not.toEqual(updatedUser.banType)
+    expect(originalUser.deactivated).not.toEqual(updatedUser.deactivated)
+  })
+
+  describe('user.ban_type', () => {
+    it('Does not change ban type', async () => {
+      const { id: userId } = await createUser({
+        email: faker.internet.email(),
+        firstName: faker.person.firstName(),
+        lastName: faker.person.lastName(),
+      })
+      await client.query(`UPDATE users SET ban_type = 'shadow' WHERE id = $1`, [
+        userId,
+      ])
+      await adminUpdateStudentUser(userId, {
+        email: faker.internet.email(),
+        verified: false,
+        deactivated: false,
+        banType: 'shadow',
+      })
+      const updatedUser = makeSomeRequired(
+        (await client.query(`SELECT * FROM users WHERE id = $1`, [userId]))
+          .rows[0],
+        ['id', 'email', 'banType']
+      )
+      expect(updatedUser.banType).toEqual('shadow')
+    })
+
+    it('Nulls out ban type', async () => {
+      const { id: userId } = await createUser({
+        email: faker.internet.email(),
+        firstName: faker.person.firstName(),
+        lastName: faker.person.lastName(),
+      })
+      await client.query(`UPDATE users SET ban_type = 'shadow' WHERE id = $1`, [
+        userId,
+      ])
+      await adminUpdateStudentUser(userId, {
+        email: faker.internet.email(),
+        verified: false,
+        deactivated: false,
+        banType: null,
+      })
+      const updatedUser = makeSomeRequired(
+        (await client.query(`SELECT * FROM users WHERE id = $1`, [userId]))
+          .rows[0],
+        ['id', 'email']
+      )
+      expect(updatedUser.banType).not.toBeDefined()
+    })
+
+    it('Updates ban type', async () => {
+      const { id: userId } = await createUser({
+        email: faker.internet.email(),
+        firstName: faker.person.firstName(),
+        lastName: faker.person.lastName(),
+      })
+      await adminUpdateStudentUser(userId, {
+        email: faker.internet.email(),
+        verified: false,
+        deactivated: false,
+        banType: 'shadow',
+      })
+      const updatedUser = makeSomeRequired(
+        (await client.query(`SELECT * FROM users WHERE id = $1`, [userId]))
+          .rows[0],
+        ['id', 'email', 'banType']
+      )
+      expect(updatedUser.banType).toEqual('shadow')
+    })
+  })
+})
+
+async function createUser(
+  userData: Partial<CreateUserPayload> = {}
+): Promise<{ id: Ulid }> {
+  return (
+    await client.query(
+      'INSERT INTO users (id, first_name, last_name, email, referral_code) VALUES($1, $2, $3, $4, $5) RETURNING id',
+      [
+        getDbUlid(),
+        userData.firstName ?? faker.person.firstName(),
+        userData.lastName ?? faker.person.lastName(),
+        userData.email ?? faker.internet.email(),
+        faker.string.alphanumeric(20),
+      ]
+    )
+  ).rows[0]
+}
+
+async function getStudentProfile(userId: string) {
+  return client.query('SELECT * FROM student_profiles WHERE user_id = $1', [
+    userId,
+  ])
+}
+
+async function createTeacherClass() {
+  return (
+    await client.query(
+      'INSERT INTO teacher_classes (id, name, code) VALUES ($1, $2, $3) RETURNING id',
+      [getDbUlid(), faker.word.noun(), faker.string.alpha(6)]
+    )
+  ).rows[0]
+}

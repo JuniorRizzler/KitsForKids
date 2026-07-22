@@ -1,0 +1,1648 @@
+import {
+  DetectLabelsCommand,
+  DetectModerationLabelsCommand,
+  ModerationLabel,
+} from '@aws-sdk/client-rekognition'
+import {
+  DetectPiiEntitiesCommand,
+  DetectToxicContentCommand,
+} from '@aws-sdk/client-comprehend'
+import crypto from 'crypto'
+import { LangfuseGenerationClient, LangfuseTraceClient } from 'langfuse-node'
+import { chunk, isEmpty } from 'lodash'
+import { TextPromptClient } from 'langfuse-core'
+import logger from '../../logger'
+import { client as langfuseClient } from '../../clients/langfuse'
+import {
+  addTraceTags,
+  runWithModelObservation,
+  runWithTrace,
+  Trace,
+} from '../AiObservabilityService'
+import {
+  CENSORED_BY,
+  CensoredSessionMessage,
+  createCensoredMessage,
+} from '../../models/CensoredSessionMessage'
+import * as OpenAIService from '../OpenAIService'
+import { OpenAiResponseType } from '../OpenAIService'
+import * as UsersRepo from '../../models/User'
+import * as SessionRepo from '../../models/Session'
+import {
+  ExtractedTextItem,
+  SessionTranscript,
+  SessionTranscriptItem,
+} from '../../models/Session'
+import { timeLimit } from '../../utils/time-limit'
+import * as PromptService from '../PromptService'
+import * as SessionService from '../SessionService'
+import SocketService from '../SocketService'
+import config from '../../config'
+import * as ModerationInfractionsRepo from '../../models/ModerationInfractions'
+import {
+  USER_BAN_REASONS,
+  USER_BAN_TYPES,
+  UserSessionFlags,
+} from '../../constants'
+import {
+  AWSRekognitionClient,
+  AWSComprehendClient,
+  putObject,
+} from '../AwsService'
+import * as ShareableDomainsRepo from '../../models/ShareableDomains/queries'
+import {
+  BedrockToolChoice,
+  BedrockTools,
+  invokeModel,
+} from '../AwsBedrockService'
+import { ModerationInfraction } from '../../models/ModerationInfractions/types'
+import { runInTransaction, TransactionClient } from '../../db'
+import { PrimaryUserRole } from '../UserRolesService'
+import { resize } from '../../utils/image-utils'
+import {
+  getContextualSettings as getModerationContextualSettings,
+  getRealTimeSettings as getModerationRealTimeSettings,
+} from '../../models/ModerationSettings/queries'
+import { GetModerationSettingResult } from '../../models/ModerationSettings/types'
+import * as ModerationTypes from './types'
+import { ModerationAIResult, ModerationSource } from './types'
+import { weightModerationInfractions } from './ModerationPenaltyService'
+import * as Regex from './regex'
+import { secondsInMs } from '../../utils/time-utils'
+import Logger from '../../logger'
+import { extractTextFromImage } from '../VisionService'
+
+const topLevelCategoryFilter = (label: ModerationLabel) =>
+  label.TaxonomyLevel === 1
+
+const moderationLabelToInfractionReason = (
+  label: ModerationLabel
+): ModerationTypes.ImageModerationInfractionReason => {
+  return {
+    reason: label.Name ?? ModerationTypes.LiveMediaModerationCategories.UNKNOWN,
+    details: { confidence: label.Confidence },
+  }
+}
+
+const DIRECT_MESSAGE_TAG = 'direct_message'
+const MESSAGE_TAG = 'session_chat'
+const WHITEBOARD_TEXT_TAG = 'whiteboard_text'
+
+async function detectPersonInImage({
+  image,
+  moderationSettings,
+  sessionId,
+  trace,
+}: {
+  image: Buffer
+  moderationSettings: GetModerationSettingResult
+  sessionId?: string
+  trace?: LangfuseTraceClient
+}) {
+  try {
+    const labelResponse = await runWithModelObservation(
+      () =>
+        AWSRekognitionClient.send(
+          new DetectLabelsCommand({
+            Image: {
+              Bytes: new Uint8Array(image),
+            },
+            MinConfidence: config.imageModerationMinConfidence,
+            Settings: {
+              GeneralLabels: {
+                LabelInclusionFilters: ['Person'],
+              },
+            },
+          })
+        ),
+      {
+        trace,
+        name: 'detectPerson',
+        model: 'rekognition',
+      }
+    )
+
+    const labels = labelResponse.Labels ?? []
+
+    const personConfidenceThreshold =
+      moderationSettings[
+        ModerationTypes.LiveMediaModerationCategories.PERSON_IN_IMAGE
+      ].threshold
+    // Rekognition returns `Confidence` as a percentage from 0 to 100
+    // Our DB thresholds are stored as decimals from 0 to 1. We convert them to percentages below for comparison
+    const thresholdPercent = personConfidenceThreshold
+      ? personConfidenceThreshold * 100
+      : config.imageModerationMinConfidence
+
+    const labelFailures = labels
+      .filter(
+        (label) => label.Confidence && label.Confidence >= thresholdPercent
+      )
+      .map((label) => ({
+        reason: ModerationTypes.LiveMediaModerationCategories.PERSON_IN_IMAGE,
+        details: {
+          label: label.Name,
+          confidence: label.Confidence,
+        },
+      }))
+
+    return labelFailures
+  } catch (err) {
+    logger.error({ sessionId, err }, 'Failed to detect a person in image')
+    throw new Error(
+      `Failed to detect a person in image for session ${sessionId}`
+    )
+  }
+}
+
+/*
+  Detect harmful content in the image.
+  We are only looking at the top level categories for now:
+    - Explicit
+    - Non-Explicit Nudity of Intimate parts and Kissing
+    - Swimwear or Underwear
+    - Violence
+    - Visually Disturbing
+    - Drugs & Tobacco
+    - Alcohol
+    - Rude Gestures
+    - Gambling
+    - Hate Symbols
+  Full list of labels with categories can be found here: https://docs.aws.amazon.com/rekognition/latest/dg/samples/rekognition-moderation-labels.zip
+*/
+async function detectImageModerationInfractions(
+  image: Buffer,
+  moderationSettings: GetModerationSettingResult,
+  sessionId?: string,
+  trace?: LangfuseTraceClient
+) {
+  try {
+    const moderationLabelsResponse = await runWithModelObservation(
+      () =>
+        AWSRekognitionClient.send(
+          new DetectModerationLabelsCommand({
+            Image: {
+              Bytes: new Uint8Array(image),
+            },
+            MinConfidence: config.imageModerationMinConfidence,
+          })
+        ),
+      {
+        trace,
+        name: 'detectModerationLabels',
+        model: 'rekognition',
+      }
+    )
+
+    const moderationLabels = moderationLabelsResponse.ModerationLabels ?? []
+    return moderationLabels
+      .filter(topLevelCategoryFilter)
+      .filter((label) => {
+        const confidence = label.Confidence
+        if (!confidence) return false
+
+        const threshold = label.Name
+          ? moderationSettings[label.Name].threshold
+          : 0
+        // Rekognition returns `Confidence` as a percentage from 0 to 100
+        // Our DB thresholds are stored as decimals from 0 to 1. We convert them to percentages below for comparison
+        const thresholdPercent = threshold
+          ? threshold * 100
+          : config.imageModerationMinConfidence
+        return confidence >= thresholdPercent
+      })
+      .map(moderationLabelToInfractionReason)
+  } catch (err) {
+    logger.error({ sessionId, err }, 'Failed to moderate image')
+    throw new Error(`Failed to moderate image for session ${sessionId}`)
+  }
+}
+
+async function detectToxicContent(
+  textSegments: string[],
+  moderationSettings: GetModerationSettingResult,
+  trace?: LangfuseTraceClient
+) {
+  const toxicContent = []
+  const concatenatedText = textSegments.join(' ')
+  const result = await runWithModelObservation(
+    () =>
+      AWSComprehendClient.send(
+        new DetectToxicContentCommand({
+          TextSegments: [{ Text: concatenatedText }],
+          LanguageCode: 'en',
+        })
+      ),
+    {
+      trace,
+      name: 'detectToxicityInText',
+      model: 'comprehend',
+      input: textSegments,
+    }
+  )
+
+  if (result.ResultList) {
+    toxicContent.push(
+      ...result.ResultList.map((r) => ({
+        text: concatenatedText,
+        result: r,
+      }))
+    )
+  }
+
+  const rudeGesture =
+    moderationSettings[
+      ModerationTypes.LiveMediaModerationCategories.RUDE_GESTURES
+    ]
+  const threshold = rudeGesture
+    ? rudeGesture.threshold * 100
+    : config.toxicityModerationMinConfidence
+
+  const highToxicity = toxicContent
+    .filter(({ result }) => result.Toxicity && result.Toxicity >= threshold)
+    .map(({ result, text }) => ({
+      reason: ModerationTypes.LiveMediaModerationCategories.RUDE_GESTURES,
+      details: {
+        toxicity: result.Toxicity,
+        text,
+        labels: result.Labels,
+      },
+    }))
+
+  return highToxicity
+}
+
+async function isLikelyToBeAnEmail({
+  entityConfidence,
+  entityText,
+  sessionId,
+  isVolunteer,
+  trace,
+}: {
+  entityConfidence: number
+  entityText: string
+  sessionId?: string
+  isVolunteer?: boolean
+  trace?: LangfuseTraceClient
+}) {
+  const isMaybeEmail =
+    entityConfidence >= config.emailModerationConfidenceThreshold &&
+    Regex.matchesEmailPattern(entityText)
+
+  if (!isMaybeEmail) {
+    return false
+  }
+
+  const aiModerationResult = await getAiModerationResult(
+    {
+      message: entityText,
+      sessionId,
+    },
+    isVolunteer,
+    trace
+  )
+
+  return aiModerationResult?.results.reasons?.email ?? false
+}
+
+async function isLikelyToBeAPhoneNumber({
+  entityConfidence,
+  entityText,
+  sessionId,
+  isVolunteer,
+  trace,
+}: {
+  entityConfidence: number
+  entityText: string
+  sessionId?: string
+  isVolunteer?: boolean
+  trace?: LangfuseTraceClient
+}) {
+  // Since many users will be sharing numbers that look like phone numbers,
+  // we want to moderate them in similar way we moderate phone numbers in messages.
+  // PII is very permissive with what's a phone number, so let's run it through our regex
+  // and then through the false positive fallback
+  const isMaybePhone =
+    entityConfidence >= config.phoneNumberModerationConfidenceThreshold &&
+    Regex.matchesPhoneNumberPattern(entityText)
+
+  if (!isMaybePhone) {
+    return false
+  }
+
+  const aiModerationResult = await getAiModerationResult(
+    {
+      message: entityText,
+      sessionId,
+    },
+    isVolunteer,
+    trace
+  )
+
+  return aiModerationResult?.results?.reasons?.phone ?? false
+}
+
+function existsInArray(array: any[], item: any) {
+  return array.some((i) => i?.details?.text === item)
+}
+
+const meetsOrExceedsLinkConfidenceThreshold = (
+  link: Pick<ModerationTypes.ModeratedLink, 'details'>
+) => link.details.confidence >= Number(config.minimumModerationLinkConfidence)
+
+export function filterDisallowedDomains({
+  allowedDomains,
+  links,
+}: {
+  allowedDomains: string[]
+  links: ModerationTypes.ModeratedLink[]
+}): ModerationTypes.ModeratedLink[] {
+  return links.filter(
+    (link) => !isAllowedUrl(allowedDomains, link.details.text)
+  )
+}
+
+function isAllowedUrl(allowedDomains: string[], url: string = '') {
+  const lowercased = url.toLowerCase()
+
+  if (lowercased.includes('.edu')) return true
+
+  return allowedDomains.some((domain) => lowercased.includes(domain))
+}
+
+async function checkForFullAddresses({
+  text,
+  sessionId,
+}: {
+  text: string
+  sessionId?: string
+}): Promise<{
+  reason: ModerationTypes.LiveMediaModerationCategories.ADDRESS
+  details: { text: string; confidence: number; explanation: string }
+} | null> {
+  const modelId = config.awsBedrockSonnet4Id
+
+  const promptData = await PromptService.getPromptWithFallback(
+    PromptService.PromptName.GET_ADDRESS_DETECTION_MODERATION_DECISION
+  )
+
+  const t = langfuseClient.trace({
+    name: ModerationTypes.LangfuseTraceName.MODERATE_SESSION_MESSAGE,
+    sessionId,
+  })
+
+  const VERIFY_EMAIL_RESPONSE_TOOL: BedrockTools = [
+    {
+      name: 'json_response',
+      description: 'Prints answer in json format',
+      input_schema: {
+        type: 'object',
+        properties: {
+          confidence: {
+            type: 'string',
+            description: 'The confidence rating',
+          },
+          explanation: {
+            type: 'string',
+            description:
+              'The explanation of why the confidence rating was choosen',
+          },
+        },
+        required: ['confidence', 'explanation'],
+      },
+    },
+  ]
+
+  const gen = t.generation({
+    name: ModerationTypes.LangfuseGenerationName
+      .GET_ADDRESS_DETECTION_MODERATION_DECISION,
+    model: modelId,
+    input: { text },
+    // Attach prompt object, if it exists, in order to associate the generation with the prompt in LF
+    ...(promptData.promptObject && { prompt: promptData.promptObject }),
+  })
+  try {
+    const completion =
+      await invokeModel<ModerationTypes.AddressDetectionModelResponse>({
+        modelId,
+        text,
+        prompt: promptData.prompt,
+        tools_option: {
+          tool_choice: { type: BedrockToolChoice.TOOL, name: 'json_response' },
+          tools: VERIFY_EMAIL_RESPONSE_TOOL,
+        },
+      })
+
+    gen.end({
+      output: completion,
+    })
+    if (completion) {
+      return {
+        reason: ModerationTypes.LiveMediaModerationCategories.ADDRESS,
+        details: {
+          text,
+          confidence: completion.confidence,
+          explanation: completion.explanation,
+        },
+      }
+    } else {
+      return null
+    }
+  } catch (err) {
+    logger.error({ sessionId, err }, 'Failed to detect addresses')
+    return null
+  }
+}
+
+async function checkForQuestionableLinks({
+  links,
+  sessionId,
+}: {
+  links: ModerationTypes.ModeratedLink[]
+  sessionId?: string
+}): Promise<ModerationTypes.ModeratedLinkResponse | null> {
+  const modelId = config.awsBedrockHaikuId
+
+  const promptData = await PromptService.getPromptWithFallback(
+    PromptService.PromptName.GET_QUESTIONABLE_LINK_MODERATION_DECISION
+  )
+
+  const t = langfuseClient.trace({
+    name: ModerationTypes.LangfuseTraceName.MODERATE_SESSION_MESSAGE,
+    sessionId,
+  })
+
+  const formattedLinks = links
+    .map((link) => `<link>${link.details.text}</link>`)
+    .join(' ')
+
+  const gen = t.generation({
+    name: ModerationTypes.LangfuseGenerationName
+      .GET_QUESTIONABLE_LINK_MODERATION_DECISION,
+    model: modelId,
+    input: {
+      links: formattedLinks,
+    },
+    // Attach prompt object, if it exists, in order to associate the generation with the prompt in LF
+    ...(promptData.promptObject && { prompt: promptData.promptObject }),
+  })
+
+  const QUESTIONABLE_LINKS_RESPONSE_TOOL: BedrockTools = [
+    {
+      name: 'json_response',
+      description: 'Prints answer in json format',
+      input_schema: {
+        type: 'object',
+        properties: {
+          links: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                link: {
+                  type: 'string',
+                  description: 'The name of the extracted link',
+                },
+                confidence: {
+                  type: 'number',
+                  description:
+                    'The confidence rating that the link is inappropriate',
+                },
+                policyNames: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  descrption: 'Array of the policy names the link violated',
+                },
+                explanation: {
+                  type: 'string',
+                  description:
+                    'The explanation why the confidence and policyNames were choosen',
+                },
+              },
+              required: ['link', 'confidence', 'policyNames', 'explanation'],
+            },
+          },
+        },
+        required: ['links'],
+      },
+    },
+  ]
+
+  try {
+    const completion = await invokeModel<
+      ModerationTypes.ModeratedLinkResponse['details']
+    >({
+      modelId,
+      text: formattedLinks,
+      prompt: promptData.prompt,
+      tools_option: {
+        tool_choice: { type: BedrockToolChoice.TOOL, name: 'json_response' },
+        tools: QUESTIONABLE_LINKS_RESPONSE_TOOL,
+      },
+    })
+
+    gen.end({
+      output: completion,
+    })
+    if (completion) {
+      return {
+        reason: ModerationTypes.LiveMediaModerationCategories.LINK,
+        details:
+          completion satisfies ModerationTypes.ModeratedLinkResponse['details'],
+      }
+    } else {
+      return null
+    }
+  } catch (err) {
+    logger.error({ sessionId, err }, 'Failed to detect questionable links')
+    return null
+  }
+}
+
+async function detectPii({
+  text,
+  sessionId,
+  isVolunteer,
+  moderationSettings,
+  trace,
+}: {
+  text: string
+  sessionId?: string
+  isVolunteer?: boolean
+  moderationSettings: GetModerationSettingResult
+  trace?: LangfuseTraceClient
+}) {
+  const piiEntities = await runWithModelObservation(
+    () =>
+      AWSComprehendClient.send(
+        new DetectPiiEntitiesCommand({
+          Text: text,
+          LanguageCode: 'en',
+        })
+      ),
+    {
+      trace,
+      name: 'detectPiiInText',
+      model: 'comprehend',
+      input: text,
+    }
+  )
+
+  const entities = piiEntities.Entities ?? []
+
+  const links: ModerationTypes.ModeratedLink[] = []
+  const emails: ModerationTypes.ModeratedEmail[] = []
+  const phones: ModerationTypes.ModeratedPhone[] = []
+  const addresses: ModerationTypes.ModeratedAddress[] = []
+  for (const entity of entities) {
+    const entityStart = entity.BeginOffset
+    const entityEnd = entity.EndOffset
+    const entityText = text.slice(entityStart, entityEnd)
+    const entityConfidence = Number(entity.Score)
+
+    if (entity.Type === 'URL' && !existsInArray(links, entityText)) {
+      links.push({
+        reason: ModerationTypes.LiveMediaModerationCategories.LINK,
+        details: {
+          text: entityText,
+          confidence: entityConfidence,
+        },
+      })
+    } else if (
+      entity.Type === 'EMAIL' &&
+      !existsInArray(emails, entityText) &&
+      (await isLikelyToBeAnEmail({
+        entityConfidence,
+        entityText,
+        sessionId,
+        isVolunteer,
+        trace,
+      }))
+    ) {
+      emails.push({
+        reason: ModerationTypes.LiveMediaModerationCategories.EMAIL,
+        details: {
+          text: entityText,
+          confidence: entityConfidence,
+        },
+      })
+    } else if (
+      entity.Type === 'PHONE' &&
+      (await isLikelyToBeAPhoneNumber({
+        entityConfidence,
+        entityText,
+        sessionId,
+        isVolunteer,
+        trace,
+      })) &&
+      !existsInArray(phones, entityText)
+    ) {
+      phones.push({
+        reason: ModerationTypes.LiveMediaModerationCategories.PHONE,
+        details: {
+          text: entityText,
+          confidence: entityConfidence,
+        },
+      })
+    } else if (
+      entity.Type === 'ADDRESS' &&
+      !existsInArray(addresses, entityText)
+    ) {
+      addresses.push({
+        reason: ModerationTypes.LiveMediaModerationCategories.ADDRESS,
+        details: {
+          text: entityText,
+          confidence: entityConfidence,
+        },
+      })
+    }
+  }
+
+  const moderatedPII: ModerationTypes.ModeratedPII[] = [...emails, ...phones]
+
+  const allowedDomains = await ShareableDomainsRepo.getAllowedDomains()
+  const moderatedLinks = filterDisallowedDomains({
+    allowedDomains,
+    links,
+  }).filter(meetsOrExceedsLinkConfidenceThreshold)
+
+  if (moderatedLinks.length > 0) {
+    const questionableLinks = await checkForQuestionableLinks({
+      links: moderatedLinks,
+      sessionId,
+    })
+    if (questionableLinks !== null) {
+      const moderatedQuestionableLinks = questionableLinks?.details.links
+        .map(
+          (link) =>
+            ({
+              reason: ModerationTypes.LiveMediaModerationCategories.LINK,
+              details: {
+                text: link.link,
+                confidence: link.details.confidence,
+                policyNames: link.details.policyNames,
+                explanation: link.details.explanation,
+              },
+            }) as ModerationTypes.ModeratedLink
+        )
+        .filter(meetsOrExceedsLinkConfidenceThreshold)
+
+      moderatedPII.push(...moderatedQuestionableLinks)
+    }
+  }
+
+  if (addresses.length > 0) {
+    const moderatedAddress = await checkForFullAddresses({ text, sessionId })
+
+    const addressSetting =
+      moderationSettings[ModerationTypes.LiveMediaModerationCategories.ADDRESS]
+
+    const addressConfidenceThreshold = addressSetting
+      ? addressSetting.threshold * 100
+      : config.minimumModerationAddressConfidence
+
+    if (
+      moderatedAddress &&
+      moderatedAddress?.details?.confidence >= addressConfidenceThreshold
+    ) {
+      moderatedPII.push(moderatedAddress)
+    }
+  }
+
+  return moderatedPII
+}
+
+async function detectTextModerationInfractions({
+  image,
+  sessionId,
+  isVolunteer,
+  moderationSettings,
+  trace,
+}: {
+  image: Buffer
+  sessionId?: string
+  isVolunteer?: boolean
+  moderationSettings: GetModerationSettingResult
+  trace?: LangfuseTraceClient
+}) {
+  const textSegments = await extractTextFromImage(image, trace)
+
+  if (textSegments.length === 0) {
+    return []
+  }
+
+  const [toxicity, pii] = await Promise.all([
+    detectToxicContent(textSegments, moderationSettings, trace),
+    detectPii({
+      text: textSegments.join(' '),
+      sessionId,
+      isVolunteer,
+      moderationSettings,
+      trace,
+    }),
+  ])
+
+  return [...toxicity, ...pii]
+}
+
+export async function saveInfractionImageToBucket({
+  locationPrefix,
+  image,
+  source,
+}: {
+  locationPrefix: string
+  image: Buffer
+  source: Extract<
+    ModerationTypes.ModerationSource,
+    'screenshare' | 'image_upload' | 'whiteboard' | 'assignment_image'
+  >
+}): Promise<{ location: string }> {
+  let bucketName: string
+  switch (source) {
+    case 'screenshare':
+      bucketName = config.awsS3.moderatedScreenshareBucket
+      break
+    case 'image_upload':
+      bucketName = config.awsS3.moderatedSessionImageUploadBucket
+      break
+    case 'whiteboard':
+      bucketName = config.awsS3.moderatedSessionWhiteboardImageUploadBucket
+      break
+    case 'assignment_image':
+      bucketName = config.awsS3.moderatedAssignmentsBucket
+      break
+  }
+  if (!bucketName)
+    throw new Error(
+      `Could not save moderated image to S3: No bucket registered for source ${source}`
+    )
+  const s3Key = `${locationPrefix}-${crypto.randomBytes(8).toString('hex')}`
+  const result = await putObject(bucketName, s3Key, image)
+  return { location: result.location }
+}
+
+export async function getIndividualSessionMessageModerationResponse({
+  censoredSessionMessage,
+  isVolunteer,
+  trace,
+}: {
+  censoredSessionMessage: Pick<CensoredSessionMessage, 'message'> & {
+    sessionId?: string
+  } & { id?: string }
+  isVolunteer?: boolean
+  trace?: LangfuseTraceClient
+}) {
+  const promptData = await PromptService.getPromptWithFallback(
+    PromptService.PromptName.GET_SESSION_MESSAGE_MODERATION_DECISION
+  )
+
+  let gen: LangfuseGenerationClient | undefined = undefined
+  if (trace) {
+    gen = trace.generation({
+      name: ModerationTypes.LangfuseGenerationName
+        .SESSION_MESSAGE_MODERATION_DECISION,
+      model: OpenAIService.MODEL_ID,
+      input: { censoredSessionMessage, isVolunteer },
+      // Attach prompt object, if it exists, in order to associate the generation with the prompt in LF
+      ...(promptData.promptObject && { prompt: promptData.promptObject }),
+    })
+  }
+
+  try {
+    const response = await OpenAIService.invokeModel({
+      prompt: promptData.prompt,
+      userMessage: wrapMessageInXmlTags(
+        censoredSessionMessage.message,
+        isVolunteer
+      ),
+    })
+
+    if (gen) {
+      gen.end({
+        output: response,
+      })
+    }
+
+    return response.results
+  } catch (err) {
+    logger.error(
+      {
+        error: err,
+        censoredSessionMessageId:
+          censoredSessionMessage?.id ??
+          'No ID: Text was likely extracted from an image',
+      },
+      `Error while moderating session message`
+    )
+  }
+}
+const getAiModerationResult = async (
+  censoredSessionMessage: Pick<CensoredSessionMessage, 'message'> & {
+    sessionId?: string
+  },
+  isVolunteer?: boolean,
+  trace?: LangfuseTraceClient
+): Promise<null | { results: ModerationAIResult }> => {
+  const r = await timeLimit({
+    promise: getIndividualSessionMessageModerationResponse({
+      censoredSessionMessage,
+      isVolunteer,
+      trace,
+    }),
+    fallbackReturnValue: null,
+    timeLimitReachedErrorMessage:
+      'AI Moderation time limit reached. Returning regex value',
+    waitInMs: config.moderateMessageTimeLimitMs,
+  })
+  return { results: r }
+}
+
+export async function moderateAssignmentInfo(text: string): Promise<string[]> {
+  // Regex first
+  const regexDecision = await Regex.regexModerate(text)
+  if (regexDecision.isClean) {
+    return []
+  }
+
+  // Consult AI if regex comes back with a match
+  const prompt = await PromptService.getPromptWithFallback(
+    PromptService.PromptName.SESSION_TRANSCRIPT_MODERATION
+  )
+  const trace = langfuseClient.trace({
+    name: ModerationTypes.LangfuseTraceName.MODERATE_ASSIGNMENT_INFO,
+  })
+  const generation = trace.generation({
+    name: ModerationTypes.LangfuseGenerationName.MODERATE_ASSIGNMENT_INFO,
+    input: text,
+    ...(prompt.promptObject && { prompt: prompt.promptObject }),
+  })
+
+  const output = await timeLimit({
+    promise: OpenAIService.invokeModel({
+      prompt: prompt.prompt,
+      userMessage: text,
+      responseType: OpenAiResponseType.JSON,
+    }),
+    fallbackReturnValue: null,
+    timeLimitReachedErrorMessage:
+      'Could not get assignment info moderation decision in time',
+    waitInMs: secondsInMs(10),
+  })
+
+  generation.end({
+    output,
+  })
+
+  if (!output) {
+    Logger.warn('Could not get AI moderation decision about assignment in time')
+    throw new Error('Could not process assignment')
+  }
+
+  return output.results?.reasons ?? []
+}
+
+export type oldClientModerationResult = boolean
+
+export async function moderateMessage(
+  {
+    message,
+    senderId,
+    userType,
+    sessionId,
+  }: {
+    message: string
+    senderId: string
+    userType: PrimaryUserRole
+    sessionId?: string
+  },
+  source?: ModerationSource
+): Promise<
+  oldClientModerationResult | ModerationTypes.ModerationInfractionReasons
+> {
+  let trace: LangfuseTraceClient | undefined = undefined
+  let sessionInfo
+  if (sessionId) {
+    sessionInfo = await SessionService.getSessionInfo(sessionId)
+    if (!sessionInfo) {
+      throw new Error(
+        `Could not find session info for session with ID ${sessionId}`
+      )
+    }
+  }
+  const regexDecision = await Regex.regexModerate(message, sessionInfo?.topicId)
+
+  /*
+   * Old high-line mid town clients will not send up sessionId
+   * return `true` or `false` for them
+   */
+  if (!sessionId) {
+    return regexDecision.isClean
+  }
+
+  if (!regexDecision.isClean) {
+    // Consult AI
+    const traceName =
+      source === 'whiteboard-text-node'
+        ? ModerationTypes.LangfuseTraceName.MODERATE_WHITEBOARD_TEXT_NODE
+        : ModerationTypes.LangfuseTraceName.MODERATE_SESSION_MESSAGE
+    trace = langfuseClient.trace({
+      name: traceName,
+      metadata: { sessionId, userId: senderId },
+      input: message,
+    })
+    const censoredSessionMessage = await createCensoredMessage({
+      senderId,
+      message,
+      sessionId,
+      censoredBy: CENSORED_BY.regex,
+    })
+
+    const aiResponse: null | { results: ModerationAIResult } =
+      await getAiModerationResult(
+        censoredSessionMessage,
+        userType === 'volunteer',
+        trace
+      )
+    const aiDecision: ModerationTypes.ModerationAIResult | undefined =
+      aiResponse?.results as ModerationTypes.ModerationAIResult
+
+    // Defer to AI decision if it conflicts with regex decision
+    const isMessageAppropriate =
+      (aiDecision && aiDecision.appropriate) || regexDecision.isClean
+    if (isMessageAppropriate) {
+      return { failures: {} }
+    } else {
+      const failures = aiDecision?.reasons ?? regexDecision.failures.failures
+      logger.info(
+        { censoredSessionMessage, reasons: failures },
+        'Session message was censored'
+      )
+      return { failures }
+    }
+  }
+
+  const session = await SessionRepo.getSessionById(sessionId)
+  const isDm = !!session.endedAt
+  if (!isDm) return { failures: {} }
+  trace = langfuseClient.trace({
+    name: ModerationTypes.LangfuseTraceName.MODERATE_SESSION_MESSAGE,
+    metadata: { sessionId, userId: senderId },
+    input: message,
+  })
+  // For DMs, we'll moderate the context of the entire transcript to make sure the
+  // conversation remains appropriate.
+  const transcript = await SessionService.getSessionTranscript(sessionId)
+  transcript.messages.push({
+    messageId: 'in-flight',
+    createdAt: new Date(),
+    messageType: 'direct_message',
+    userId: senderId,
+    message,
+    role: userType,
+  } as SessionTranscriptItem)
+  const transcriptModerationResults = await moderateTranscript(
+    transcript,
+    trace
+  )
+  const uncleanDms = transcriptModerationResults.filter((flagged) =>
+    flagged.message.includes(DIRECT_MESSAGE_TAG)
+  )
+  if (uncleanDms.length) {
+    const failures = {} as Record<string, string[]>
+    transcriptModerationResults.forEach(
+      (flagged) =>
+        (failures[flagged.reason.toLowerCase().replace('_', ' ')] = [])
+    )
+    return { failures }
+  } else {
+    return { failures: {} }
+  }
+}
+
+export async function handleLiveMediaModerationInfraction(
+  userId: string,
+  sessionId: string,
+  reasons:
+    | ModerationTypes.ModerationInfractionReasons
+    | Record<
+        ModerationTypes.ImageModerationInfractionReason['reason'],
+        ModerationTypes.ImageModerationInfractionReason['details']
+      >,
+  source: ModerationTypes.LiveMediaSource,
+  moderationSettings: GetModerationSettingResult
+) {
+  // TODO: Can we separate socket events from storing infractions?
+  const socketService = SocketService.getInstance()
+  const failures: string[] = [...new Set<string>(Object.keys(reasons.failures))]
+
+  const allActiveInfractions =
+    await ModerationInfractionsRepo.getModerationInfractionsByUser(userId, {
+      active: true,
+      sessionId,
+    })
+
+  const allInfractionResons = getReasonsFromInfractions(allActiveInfractions)
+
+  if (
+    isEmpty(
+      failures.filter(
+        (failure) =>
+          failure ===
+          ModerationTypes.LiveMediaModerationCategories.PERSON_IN_IMAGE
+      )
+    )
+  ) {
+    const insertedInfraction =
+      await ModerationInfractionsRepo.insertModerationInfraction({
+        userId,
+        sessionId,
+        reason: reasons.failures,
+      })
+
+    const infractionScore = weightModerationInfractions(
+      [
+        ...allInfractionResons.filter(
+          (infractionReason) =>
+            infractionReason !==
+            ModerationTypes.LiveMediaModerationCategories.PERSON_IN_IMAGE
+        ),
+        ...getReasonsFromInfractions([insertedInfraction]),
+      ],
+      moderationSettings
+    )
+    const streamStoppingReasons = getStreamStoppingReasonsFromInfractions([
+      insertedInfraction,
+    ])
+    const doLiveMediaBan =
+      infractionScore >= config.liveMediaBanInfractionScoreThreshold
+
+    if (doLiveMediaBan) {
+      await liveMediaBanUser(userId, sessionId)
+      logger.info(
+        { userId, sessionId, infractionId: insertedInfraction.id },
+        'Live media banned user'
+      )
+    }
+
+    await socketService.emitModerationInfractionEvent(userId, {
+      isBanned: doLiveMediaBan,
+      infraction: failures,
+      source,
+      occurredAt: new Date(),
+      stopStreamImmediatelyReasons: streamStoppingReasons,
+    })
+  } else if (
+    isEmpty(
+      allInfractionResons.filter(
+        (infractionReason) =>
+          infractionReason ===
+          ModerationTypes.LiveMediaModerationCategories.PERSON_IN_IMAGE
+      )
+    )
+  ) {
+    await runInTransaction(async (tc) => {
+      /*
+       * if a person in image infraction exist, the user already received a temporary ban already
+       * if not, ban them temporarily until the partner in sesson confirms whether the frame is appropriate or not
+       */
+      await ModerationInfractionsRepo.insertModerationInfraction(
+        {
+          userId,
+          sessionId,
+          reason: reasons.failures,
+        },
+        tc
+      )
+
+      await liveMediaBanUser(userId, sessionId, tc)
+    })
+
+    await socketService.emitModerationInfractionEvent(userId, {
+      isBanned: false,
+      infraction: failures,
+      source,
+      occurredAt: new Date(),
+      stopStreamImmediatelyReasons: failures,
+    })
+    //Let the partner user decide if there's an infraction
+    await socketService.emitPotentialInfractionToPartnerEvent(
+      sessionId,
+      userId,
+      {
+        infraction: failures,
+        source,
+        occurredAt: new Date(),
+      }
+    )
+  }
+}
+
+async function liveMediaBanUser(
+  userId: string,
+  sessionId: string,
+  transactionClient?: TransactionClient
+): Promise<void> {
+  await runInTransaction(async (tc) => {
+    await UsersRepo.banUserById(
+      userId,
+      USER_BAN_TYPES.LIVE_MEDIA,
+      USER_BAN_REASONS.AUTOMATED_MODERATION,
+      tc
+    )
+    await SessionService.markSessionForReview(
+      sessionId,
+      [UserSessionFlags.liveMediaBan],
+      tc
+    )
+  }, transactionClient)
+  await SocketService.getInstance().emitUserLiveMediaBannedEvents(
+    userId,
+    sessionId
+  )
+}
+
+export function isStreamStoppingReason(
+  category: ModerationTypes.LiveMediaModerationCategories
+): boolean {
+  const streamStoppingReasons = [
+    ModerationTypes.LiveMediaModerationCategories.SWIM_WEAR,
+    ModerationTypes.LiveMediaModerationCategories.VIOLENCE,
+    ModerationTypes.LiveMediaModerationCategories.DISTURBING,
+    ModerationTypes.LiveMediaModerationCategories.HATE_SYMBOLS,
+    ModerationTypes.LiveMediaModerationCategories.LINK,
+    ModerationTypes.LiveMediaModerationCategories.EMAIL,
+    ModerationTypes.LiveMediaModerationCategories.PHONE,
+    ModerationTypes.LiveMediaModerationCategories.ADDRESS,
+    ModerationTypes.LiveMediaModerationCategories.EXPLICIT,
+    ModerationTypes.LiveMediaModerationCategories.NON_EXPLICIT,
+  ]
+  return streamStoppingReasons.includes(category)
+}
+
+export function getReasonsFromInfractions(
+  infractions: ModerationInfraction[]
+): ModerationTypes.LiveMediaModerationCategories[] {
+  return infractions.flatMap((i) => {
+    return Object.keys(i.reason)
+  }) as ModerationTypes.LiveMediaModerationCategories[]
+}
+
+export function getStreamStoppingReasonsFromInfractions(
+  infractions: ModerationInfraction[]
+): ModerationTypes.LiveMediaModerationCategories[] {
+  const reasons = getReasonsFromInfractions(infractions)
+  return reasons.filter((reason) =>
+    isStreamStoppingReason(
+      reason as ModerationTypes.LiveMediaModerationCategories
+    )
+  )
+}
+
+export type CleanTranscriptModerationResult = {
+  isClean: true
+}
+export type SanitizedTranscriptModerationResult = {
+  isClean: false
+  failures: { [key: string]: string[] }
+  sanitizedTranscript: string
+}
+export async function moderateIndividualTranscription({
+  transcript,
+  sessionId,
+  userId,
+  saidAt,
+}: {
+  transcript: string
+  sessionId: string
+  userId: string
+  saidAt: Date
+}): Promise<
+  CleanTranscriptModerationResult | SanitizedTranscriptModerationResult
+> {
+  const { isClean, failures, sanitizedMessage } =
+    await Regex.regexModerate(transcript)
+  if (isClean) return { isClean: true } as CleanTranscriptModerationResult
+
+  // If the message is unclean, track it as an infraction against the user.
+  const moderationSettings = await getModerationRealTimeSettings()
+  await handleLiveMediaModerationInfraction(
+    userId,
+    sessionId,
+    failures,
+    'audio_transcription',
+    moderationSettings
+  )
+  await createCensoredMessage({
+    message: transcript,
+    senderId: userId,
+    sessionId,
+    censoredBy: 'regex',
+    sentAt: saidAt,
+    shown: true,
+  })
+
+  return {
+    isClean: false,
+    failures: failures.failures,
+    sanitizedTranscript: sanitizedMessage,
+  } as SanitizedTranscriptModerationResult
+}
+
+export async function moderateImage(
+  image: Buffer,
+  context: ModerationTypes.ImageModerationContext,
+  trace?: Trace
+): Promise<{
+  isClean: boolean
+  failures: ModerationTypes.ModerationCategory[]
+}> {
+  const { userId, sessionId, assignmentId, isVolunteer, source } = context as {
+    userId?: string
+    sessionId?: string
+    assignmentId?: string
+    isVolunteer?: boolean
+    source: ModerationTypes.ImageModerationSource
+  }
+
+  const resizedImage = await resize(image)
+  const moderationSettings = await getModerationRealTimeSettings()
+
+  const toolName = 'json_response'
+
+  const { result } = await runWithTrace(
+    async (trace) => {
+      const promptData = await PromptService.getPromptWithFallback(
+        PromptService.PromptName.MODERATE_IMAGE
+      )
+
+      return runWithModelObservation(
+        () =>
+          invokeModel<{
+            infractions: ModerationTypes.ImageModerationInfraction[]
+          }>({
+            modelId: config.awsBedrockSonnet4Id,
+            images: [resizedImage],
+            prompt: promptData.prompt,
+            tools_option: {
+              tool_choice: {
+                type: BedrockToolChoice.TOOL,
+                name: toolName,
+              },
+              tools: [
+                {
+                  name: toolName,
+                  description:
+                    'JSON response as type ImageModerationInfractions',
+                  input_schema: {
+                    type: 'object',
+                    properties: {
+                      infractions: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            category: {
+                              type: 'string',
+                              enum: [
+                                ...ModerationTypes.IMAGE_MODERATION_CATEGORIES,
+                              ],
+                            },
+                            confidence: {
+                              type: 'number',
+                              description: 'Confidence score from 0 to 1',
+                            },
+                            text: {
+                              type: 'string',
+                              description:
+                                'Text extracted from the image related to this infraction',
+                            },
+                          },
+                          required: ['category', 'confidence'],
+                        },
+                      },
+                    },
+                    required: ['infractions'],
+                  },
+                },
+              ],
+            },
+          }),
+        {
+          trace,
+          name: 'moderateImage',
+          model: config.awsBedrockSonnet4Id,
+        }
+      )
+    },
+    {
+      trace,
+      name: 'MODERATE_IMAGE',
+      userId,
+      sessionId,
+      metadata: {
+        userId,
+        sessionId,
+        assignmentId,
+        isVolunteer,
+        source,
+      },
+    }
+  )
+
+  const allowedDomains = await ShareableDomainsRepo.getAllowedDomains()
+  const infractions = result.infractions
+    .filter((i) => {
+      const category = i.category
+      const confidence = i.confidence
+      if (category === 'LINK' && isAllowedUrl(allowedDomains, i.text)) {
+        return false
+      }
+      return (
+        moderationSettings[category] &&
+        confidence >= moderationSettings[category].threshold
+      )
+    })
+    .map((i) => i.category)
+
+  if (isEmpty(infractions)) {
+    return { isClean: true, failures: [] }
+  }
+
+  const locationPrefix =
+    context.source === 'assignment_image'
+      ? context.assignmentId
+      : context.sessionId
+  await saveInfractionImageToBucket({
+    locationPrefix,
+    image: resizedImage,
+    source,
+  })
+
+  // Duplicate moderation infractions might be present if different
+  // objects/text in the image trigger the same category.
+  return { isClean: false, failures: [...new Set(infractions)] }
+}
+
+/*
+  This function is designed to ban a user from live media as fast as possible.
+  To do that, we run each moderation check in parallel and issue moderation infractions
+  as they happen. By not waiting for all checks to complete, we can ensure that we
+  turn the screen share off as soon as possible.
+
+  NOTE: Due to high volume of screenshare images:
+    1. Do not run in trace.
+    2. Do not use LLM (cost).
+*/
+export async function moderateScreenshareImage(options: {
+  image: Buffer
+  sessionId: string
+  userId: string
+  isVolunteer?: boolean
+}) {
+  const { image, userId, sessionId, isVolunteer } = options
+  const resizedImage = await resize(image, {
+    width: 1000,
+  })
+  const moderationSettings = await getModerationRealTimeSettings()
+
+  const moderationChecks = [
+    () =>
+      detectImageModerationInfractions(
+        resizedImage,
+        moderationSettings,
+        sessionId
+      ),
+    () =>
+      detectPersonInImage({
+        image: resizedImage,
+        sessionId,
+        moderationSettings,
+      }),
+    () =>
+      detectTextModerationInfractions({
+        image: resizedImage,
+        sessionId,
+        isVolunteer,
+        moderationSettings,
+      }),
+  ]
+
+  moderationChecks.forEach((checkFn) => {
+    checkFn()
+      .then(async (infractions) => {
+        if (!isEmpty(infractions)) {
+          const { location: imageUrl } = await saveInfractionImageToBucket({
+            locationPrefix: sessionId,
+            image: resizedImage,
+            source: 'screenshare',
+          })
+          logger.info(
+            { sessionId, reasons: infractions, imageUrl, userId },
+            'Screenshare image triggered moderation'
+          )
+
+          const infractionRecord = infractions.reduce(
+            (acc, reason) => {
+              acc[reason.reason] = { ...reason.details, imageUrl }
+              return acc
+            },
+            {} as Record<
+              ModerationTypes.ImageModerationInfractionReason['reason'],
+              ModerationTypes.ImageModerationInfractionReason['details']
+            >
+          )
+          await handleLiveMediaModerationInfraction(
+            userId,
+            sessionId,
+            { failures: infractionRecord },
+            'screenshare',
+            moderationSettings
+          )
+        }
+      })
+      .catch((err) => {
+        logger.error(
+          { sessionId, userId, err },
+          'Failed to process screenshare moderation check.'
+        )
+      })
+  })
+}
+
+/**
+ * Enclose the given message in <student></student> or <tutor></tutor> tags.
+ */
+export const wrapMessageInXmlTags = (
+  message: string,
+  isVolunteer?: boolean
+): string => {
+  const xmlTag =
+    isVolunteer === undefined ? 'unknown' : isVolunteer ? 'tutor' : 'student'
+  return `<${xmlTag}>${message}</${xmlTag}>`
+}
+
+const getSessionTranscriptModerationResult = async (
+  prompt: string,
+  chunkAsString: string,
+  model: string,
+  trace: LangfuseTraceClient,
+  promptObject?: TextPromptClient
+): Promise<TranscriptChunkModerationResult> => {
+  const gen = trace.generation({
+    name: ModerationTypes.LangfuseGenerationName
+      .SESSION_TRANSCRIPT_MODERATION_DECISION,
+    model,
+    input: chunkAsString,
+    ...(promptObject && { prompt: promptObject }),
+  })
+  const result = await OpenAIService.invokeModel({
+    prompt,
+    userMessage: chunkAsString,
+  })
+  gen.end({
+    output: result,
+  })
+  const moderationResult = result.results as TranscriptChunkModerationResult
+  return moderationResult
+}
+
+export type TranscriptChunkModerationResult = {
+  confidence: number // higher = more likely to be inappropriate
+  explanation: string
+  reasons: ModerationTypes.ModerationSessionReviewFlagReason[]
+  flaggedMessages: string[]
+}
+type FlaggedReason = {
+  reason: ModerationTypes.ModerationSessionReviewFlagReason | string
+  message: string
+  confidence: Number
+}
+export const moderateTranscript = async (
+  transcript: SessionTranscript,
+  trace: LangfuseTraceClient,
+  extractedText?: string[]
+): Promise<FlaggedReason[]> => {
+  const extractedTextItems: ExtractedTextItem[] =
+    extractedText?.map((text) => {
+      return {
+        messageType: 'whiteboard_text',
+        message: text,
+        role: 'unknown',
+      }
+    }) ?? []
+
+  const getChunkAsString = (
+    chunk: (SessionTranscriptItem | ExtractedTextItem)[]
+  ): string => {
+    return chunk.reduce((acc: string, item) => {
+      const messageTag =
+        item.messageType === 'whiteboard_text'
+          ? WHITEBOARD_TEXT_TAG
+          : item.messageType === 'direct_message'
+            ? DIRECT_MESSAGE_TAG
+            : MESSAGE_TAG
+      return (
+        acc +
+        `<${messageTag}><role>${item.role}</role>${item.message}</${messageTag}>\n`
+      )
+    }, '')
+  }
+
+  const promptData = await PromptService.getPromptWithFallback(
+    PromptService.PromptName.SESSION_TRANSCRIPT_MODERATION
+  )
+
+  const results: TranscriptChunkModerationResult[] = []
+  const chunks: (SessionTranscriptItem | ExtractedTextItem)[][] = chunk(
+    [...transcript.messages, ...extractedTextItems],
+    config.contextualModerationBatchSize
+  )
+
+  for (const chunk of chunks) {
+    const message = getChunkAsString(chunk)
+    const result = await getSessionTranscriptModerationResult(
+      promptData.prompt,
+      message,
+      OpenAIService.MODEL_ID,
+      trace,
+      promptData?.promptObject
+    )
+    results.push(result)
+  }
+
+  const allReasons = results.flatMap((result) => result.reasons)
+
+  const confidenceThresholdMap = new Map<string, Number>()
+
+  const moderationSettings = await getModerationContextualSettings()
+
+  for (const reason of allReasons) {
+    const thresholdObj = moderationSettings[reason]
+
+    if (thresholdObj) {
+      confidenceThresholdMap.set(reason, Number(thresholdObj.threshold))
+    } else {
+      confidenceThresholdMap.set(
+        reason,
+        config.contextualModerationConfidenceThreshold
+      )
+      logger.warn({ reason }, 'No confidence threshold set for reason')
+    }
+  }
+
+  let flaggedOutput: FlaggedReason[] = []
+
+  for (const result of results) {
+    for (const reason of result.reasons) {
+      const threshold =
+        confidenceThresholdMap.get(reason) ??
+        config.contextualModerationConfidenceThreshold
+
+      // OpenAI returns confidence as a percentage from 0 to 100
+      // Our DB thresholds are stored as decimals from 0 to 1. We convert them to percentages below for comparison
+      const thresholdPercent =
+        Number(threshold) <= 1 ? Number(threshold) * 100 : Number(threshold)
+
+      // Check for undefined confidence and handle gracefully
+      if (result.confidence == null) {
+        logger.warn(
+          { reason, result },
+          'Transcript moderation result missing confidence value'
+        )
+        continue
+      }
+
+      if (result.confidence >= thresholdPercent) {
+        addTraceTags(trace, ['flagged-by-moderation'])
+        for (const msg of result.flaggedMessages) {
+          flaggedOutput.push({
+            reason,
+            message: msg,
+            confidence: threshold,
+          })
+        }
+      }
+    }
+  }
+
+  return flaggedOutput
+}
+
+export function getSessionFlagByModerationReason(
+  reason: ModerationTypes.ModerationSessionReviewFlagReason | string
+): UserSessionFlags {
+  switch (reason) {
+    case 'PII':
+      return UserSessionFlags.pii
+    case 'INAPPROPRIATE_CONTENT':
+      return UserSessionFlags.inappropriateConversation
+    case 'PLATFORM_CIRCUMVENTION':
+      return UserSessionFlags.platformCircumvention
+    case 'HATE_SPEECH':
+      return UserSessionFlags.hateSpeech
+    case 'SAFETY':
+      return UserSessionFlags.safetyConcern
+    default:
+      return UserSessionFlags.generalModerationIssue
+  }
+}

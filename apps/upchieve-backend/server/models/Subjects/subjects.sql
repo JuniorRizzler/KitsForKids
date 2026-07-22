@@ -1,0 +1,255 @@
+/* @name getSubjectAndTopic */
+SELECT
+    subjects.name AS subject_name,
+    subjects.id AS subject_id,
+    subjects.display_name AS subject_display_name,
+    topics.name AS topic_name,
+    topics.id AS topic_id,
+    topics.display_name AS topic_display_name,
+    tool_types.name AS tool_type
+FROM
+    subjects
+    JOIN topics ON subjects.topic_id = topics.id
+    JOIN tool_types ON subjects.tool_type_id = tool_types.id
+WHERE
+    subjects.name = :subject!
+    AND ((:topic)::text IS NULL
+        OR topics.name = (:topic)::text);
+
+
+/* @name getSessionSubjectAndTopicBySessionId */
+SELECT
+    s.id AS session_id,
+    subjects.name AS subject_name,
+    subjects.id AS subject_id,
+    topics.name AS topic_name,
+    topics.id AS topic_id
+FROM
+    sessions s
+    JOIN subjects ON subjects.id = s.subject_id
+    JOIN topics ON topics.id = subjects.topic_id
+WHERE
+    s.id = :sessionId!;
+
+
+/* @name getSubjects */
+SELECT
+    subjects.id AS id,
+    subjects.name AS name,
+    subjects.display_name AS display_name,
+    subjects.display_order AS display_order,
+    subjects.active AS active,
+    topics.name AS topic_name,
+    topics.display_name AS topic_display_name,
+    topics.dashboard_order AS topic_dashboard_order,
+    topics.training_order AS topic_training_order,
+    topics.id AS topic_id,
+    topics.icon_link AS topic_icon_link,
+    topics.color AS topic_color,
+    CASE WHEN EXISTS (
+        SELECT
+            1
+        FROM
+            computed_subject_unlocks
+        WHERE
+            subject_id = subjects.id) THEN
+        TRUE
+    ELSE
+        FALSE
+    END AS is_computed_unlock
+FROM
+    subjects
+    JOIN topics ON subjects.topic_id = topics.id;
+
+
+/* @name getSubjectQuizAliases */
+-- An alias subject has no quiz of its own; pick one default among the quizzes that unlock it,
+-- preferring a same-topic cert, then lowest display order.
+SELECT DISTINCT ON (subjects.name)
+    subjects.name AS subject_name,
+    certifications.name AS quiz_name
+FROM
+    certification_subject_unlocks csu
+    JOIN subjects ON subjects.id = csu.subject_id
+    JOIN certifications ON certifications.id = csu.certification_id
+    LEFT JOIN subjects cert_subject ON cert_subject.name = certifications.name
+WHERE
+    NOT EXISTS (
+        SELECT
+            1
+        FROM
+            quizzes
+        WHERE
+            quizzes.name = subjects.name)
+    AND EXISTS (
+        SELECT
+            1
+        FROM
+            quizzes
+        WHERE
+            quizzes.name = certifications.name)
+ORDER BY
+    subjects.name,
+    (cert_subject.topic_id = subjects.topic_id) DESC NULLS LAST,
+    cert_subject.display_order ASC NULLS LAST,
+    certifications.name ASC;
+
+
+/* @name getTopics */
+SELECT
+    id,
+    name,
+    display_name,
+    icon_link,
+    dashboard_order,
+    training_order
+FROM
+    topics
+WHERE (:topicId::integer IS NULL
+    OR id = :topicId);
+
+
+/* @name getTrainingCourses */
+SELECT
+    id,
+    name,
+    display_name
+FROM
+    training_courses;
+
+
+/* @name getQuizCertUnlocks */
+SELECT
+    quizzes.name AS quiz_name,
+    quiz_info.display_name AS quiz_display_name,
+    quiz_info.display_order AS quiz_display_order,
+    certs.name AS unlocked_cert_name,
+    cert_info.display_name AS unlocked_cert_display_name,
+    cert_info.display_order AS unlocked_cert_display_order,
+    topics.name AS topic_name,
+    topics.display_name AS topic_display_name,
+    topics.dashboard_order AS topic_dashboard_order,
+    topics.training_order AS topic_training_order,
+    quizzes.active AS quiz_is_active
+FROM
+    quiz_certification_grants qcg
+    JOIN quizzes ON quizzes.id = qcg.quiz_id
+    JOIN subjects AS quiz_info ON quiz_info.name = quizzes.name
+    JOIN certifications certs ON certs.id = qcg.certification_id
+    JOIN subjects AS cert_info ON cert_info.name = certs.name
+    JOIN topics ON topics.id = cert_info.topic_id;
+
+
+/* @name getCertSubjectUnlocks */
+SELECT
+    unlocked_subject.name AS unlocked_subject_name,
+    unlocked_subject.display_name AS unlocked_subject_display_name,
+    unlocked_subject.display_order AS unlocked_subject_display_order,
+    certifications.name AS cert_name,
+    cert_info.display_name AS cert_display_name,
+    cert_info.display_order AS cert_display_order,
+    topics.name AS topic_name
+FROM
+    certification_subject_unlocks csu
+    JOIN subjects AS unlocked_subject ON unlocked_subject.id = csu.subject_id
+    JOIN certifications ON certifications.id = csu.certification_id
+    JOIN topics ON topics.id = unlocked_subject.topic_id
+    JOIN subjects AS cert_info ON cert_info.name = certifications.name;
+
+
+/* @name getComputedSubjectUnlocks */
+SELECT
+    unlocked_subject.name AS unlocked_subject_name,
+    unlocked_subject.display_name AS unlocked_subject_display_name,
+    unlocked_subject.display_order AS unlocked_subject_display_order,
+    certifications.name AS cert_name,
+    cert_info.display_name AS cert_display_name,
+    cert_info.display_order AS cert_display_order,
+    topics.name AS topic_name
+FROM
+    computed_subject_unlocks csu
+    JOIN subjects AS unlocked_subject ON unlocked_subject.id = csu.subject_id
+    JOIN certifications ON certifications.id = csu.certification_id
+    JOIN topics ON topics.id = unlocked_subject.topic_id
+    JOIN subjects AS cert_info ON cert_info.name = certifications.name;
+
+
+/* @name getRequiredCertificationsByComputedSubjectUnlock */
+SELECT
+    s.name,
+    ARRAY_AGG(c.name ORDER BY c.name) AS required_certifications
+FROM
+    computed_subject_unlocks csu
+    JOIN subjects s ON s.id = csu.subject_id
+    JOIN certifications c ON c.id = csu.certification_id
+GROUP BY
+    s.name;
+
+
+/* @name getSubjectType */
+SELECT
+    CASE WHEN topics.name IS NOT NULL THEN
+        topics.name
+    WHEN tc.name IS NOT NULL THEN
+        'training'
+    ELSE
+        ''
+    END AS subject_type
+FROM
+    quizzes
+    LEFT JOIN subjects ON subjects.name = quizzes.name
+    LEFT JOIN topics ON topics.id = subjects.topic_id
+    LEFT JOIN training_courses tc ON tc.name = quizzes.name
+WHERE
+    quizzes.name = :subject!;
+
+
+/* @name getSubjectNameIdMapping */
+SELECT
+    subjects.name,
+    subjects.id
+FROM
+    upchieve.subjects;
+
+
+/* @name getTopicIdFromName */
+SELECT
+    id
+FROM
+    upchieve.topics
+WHERE
+    name = :topicName!;
+
+
+/* @name getSubjectsForTopicByTopicId */
+SELECT
+    subjects.id AS id,
+    subjects.name AS name,
+    subjects.display_name AS display_name,
+    subjects.display_order AS display_order,
+    subjects.active AS active,
+    topics.name AS topic_name,
+    topics.display_name AS topic_display_name,
+    topics.dashboard_order AS topic_dashboard_order,
+    topics.training_order AS topic_training_order,
+    topics.id AS topic_id,
+    topics.icon_link AS topic_icon_link,
+    topics.color AS topic_color,
+    CASE WHEN EXISTS (
+        SELECT
+            1
+        FROM
+            computed_subject_unlocks
+        WHERE
+            subject_id = subjects.id) THEN
+        TRUE
+    ELSE
+        FALSE
+    END AS is_computed_unlock
+FROM
+    topics
+    JOIN subjects ON subjects.topic_id = topics.id
+WHERE
+    topics.id = :topicId!
+    AND subjects.active IS TRUE;
+

@@ -1,0 +1,120 @@
+import { Job } from 'bull'
+import { USER_BAN_REASONS, SESSION_REPORT_REASON } from '../../../constants'
+import { getReportedUser } from '../../../models/User'
+import * as MailService from '../../../services/MailService'
+import { getSessionById } from '../../../models/Session'
+import { safeAsync } from '../../../utils/safe-async'
+import { asString } from '../../../utils/type-utils'
+import { Uuid } from '../../../models/pgUtils'
+import { Jobs } from '..'
+import { getUserById } from '../../../services/UserService'
+
+export interface EmailSessionReportedJobData {
+  userId: Uuid
+  reportedBy: Uuid
+  reportReason: string
+  reportMessage?: string
+  isBanReason: boolean
+  sessionId: Uuid
+}
+
+async function emailReportedSession(
+  job: Job<EmailSessionReportedJobData>
+): Promise<void> {
+  const {
+    data: { reportedBy, reportReason, reportMessage, isBanReason },
+  } = job
+  const userId = asString(job.data.userId)
+  const sessionId = asString(job.data.sessionId)
+  const session = await getSessionById(sessionId)
+
+  // a user should receive this email regardless of banned status
+  // need full user to create sendGrid contact below
+  // user with getReportedUser from User Repo
+  const user = await getReportedUser(userId)
+
+  const errors: string[] = []
+
+  if (!user) {
+    errors.push(`user ${userId} not found`)
+  } else {
+    const reportedUserRole =
+      session.studentId === userId ? 'student' : 'volunteer'
+
+    // Volunteers do not get banned, avoid sending a banned email notification to staff
+    if (isBanReason && reportedUserRole !== 'volunteer') {
+      const banAlert = await safeAsync(
+        // TODO: double check the email
+        MailService.sendBannedUserAlert(
+          userId,
+          USER_BAN_REASONS.SESSION_REPORTED,
+          sessionId
+        )
+      )
+      if (banAlert.error)
+        errors.push(`Failed to send ban alert email: ${banAlert.error.message}`)
+      const contactResponse = await safeAsync(
+        MailService.createContact(user.id)
+      )
+      if (contactResponse.error)
+        errors.push(
+          `Failed to add user ${userId} to ban email group: ${contactResponse.error.message}`
+        )
+    }
+
+    const reportAlert = await safeAsync(
+      MailService.sendReportedSessionAlert(
+        sessionId,
+        reportedBy,
+        reportReason,
+        reportMessage
+      )
+    )
+    if (reportAlert.error)
+      errors.push(
+        `Failed to send report alert email: ${reportAlert.error.message}`
+      )
+
+    if (reportedUserRole === 'student') {
+      const studentEmail = await safeAsync(
+        MailService.sendStudentReported(
+          user.email,
+          user.firstName,
+          reportReason
+        )
+      )
+      if (studentEmail.error)
+        errors.push(
+          `Failed to send student ${user.id} email for report: ${studentEmail.error.message}`
+        )
+    }
+
+    if (session.volunteerId) {
+      const volunteer = await getUserById(session.volunteerId)
+      if (volunteer && volunteer.email === reportedBy) {
+        if (reportReason === SESSION_REPORT_REASON.STUDENT_RUDE) {
+          await MailService.sendVolunteerBanStudentApology(
+            volunteer.email,
+            volunteer.firstName
+          )
+        } else if (reportReason === SESSION_REPORT_REASON.STUDENT_SAFETY) {
+          await MailService.sendVolunteerThanksForReport(
+            volunteer.email,
+            volunteer.firstName
+          )
+        }
+      }
+    }
+  }
+  let errMsg = ''
+  for (const err of errors) {
+    if (err) {
+      errMsg += `${err}\n`
+    }
+  }
+  if (errMsg) {
+    throw new Error(`${Jobs.EmailSessionReported}: ${errMsg}`)
+  }
+}
+
+export default emailReportedSession

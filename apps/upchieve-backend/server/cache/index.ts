@@ -1,0 +1,138 @@
+/**
+ * Cache
+ * @module cache
+ * The cache module is a wrapper around some fast key/value store,
+ * (currently Redis).
+ * It exposes a couple of CRUD type functions to abstract cache methods
+ * so that if we want to swap the backend in the future we can do
+ * so in one place.
+ */
+
+import Redis from 'ioredis'
+import { CustomError } from 'ts-custom-error'
+import config from '../config'
+import { Redlock, type Lock } from '@sesamecare-oss/redlock'
+import logger from '../logger'
+
+const redisClient = new Redis(config.redisConnectionString)
+redisClient.on('error', (error) => {
+  logger.error({ error }, `Redis Cache Error: ${error.name}`)
+})
+
+const redisLock = new Redlock([redisClient])
+
+// TODO: we should just return undefiend on KeyNotFound
+export class KeyNotFoundError extends CustomError {
+  constructor(attemptedKey: string) {
+    super(`key ${attemptedKey} was not found in the cache`)
+  }
+}
+
+export class AppendLengthZeroError extends CustomError {
+  constructor(attemptedKey: string) {
+    super(`length of doucment ${attemptedKey} after append was 0`)
+  }
+}
+
+export class KeyDeletionFailureError extends CustomError {
+  constructor(attemptedKey: string) {
+    super(`deletion of key ${attemptedKey} failed`)
+  }
+}
+
+export async function save(key: string, value: string): Promise<void> {
+  await redisClient.set(key, value)
+}
+
+/**
+ *
+ * @param key
+ * @param value
+ * @param seconds defaults to 1 day
+ */
+export async function saveWithExpiration(
+  key: string,
+  value: string,
+  seconds = 86400
+): Promise<void> {
+  // possible expiryMode values: https://redis.io/commands/set
+  await redisClient.set(key, value, 'EX', seconds)
+}
+
+export async function getTimeToExpiration(key: string): Promise<number> {
+  return await redisClient.ttl(key)
+}
+
+export async function get(key: string): Promise<string> {
+  const value = await redisClient.get(key)
+  if (value === null) {
+    throw new KeyNotFoundError(key)
+  }
+  return value
+}
+
+export async function getIfExists(key: string): Promise<string | undefined> {
+  return (await redisClient.get(key)) || undefined
+}
+
+export async function remove(key: string): Promise<number> {
+  return await redisClient.del(key)
+}
+
+export async function append(key: string, addition: string): Promise<void> {
+  const docLength = await redisClient.append(key, addition)
+  if (docLength === 0) throw new AppendLengthZeroError(key)
+}
+
+export async function rpush(key: string, addition: string): Promise<number> {
+  return await redisClient.rpush(key, addition)
+}
+
+export async function lpop(key: string): Promise<string | null> {
+  return await redisClient.lpop(key)
+}
+
+export async function lock(key: string, lockDuration: number): Promise<Lock> {
+  return await redisLock.acquire([`lock:${key}`], lockDuration)
+}
+
+export async function sadd(key: string, member: string) {
+  return await redisClient.sadd(key, member)
+}
+
+export async function smembers(key: string) {
+  return await redisClient.smembers(key)
+}
+
+export async function removeFromSet(key: string, ...members: string[]) {
+  return await redisClient.srem(key, ...members)
+}
+
+export async function getSetSize(key: string) {
+  return await redisClient.scard(key)
+}
+
+export async function exists(key: string): Promise<boolean> {
+  const result = await redisClient.exists(key)
+  return result === 1
+}
+
+export async function hset(key: string, field: string, value: string) {
+  return await redisClient.hset(key, field, value)
+}
+
+export async function hget(key: string, field: string): Promise<string | null> {
+  return await redisClient.hget(key, field)
+}
+
+export async function hkeys(key: string): Promise<string[]> {
+  return await redisClient.hkeys(key)
+}
+
+export async function hgetall(key: string): Promise<Record<string, string>> {
+  return await redisClient.hgetall(key)
+}
+
+export async function hdel(key: string, ...fields: string[]) {
+  return await redisClient.hdel(key, ...fields)
+}

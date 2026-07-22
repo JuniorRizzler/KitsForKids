@@ -1,0 +1,110 @@
+import OpenAI from 'openai'
+import config from '../config'
+import logger from '../logger'
+import { secondsInMs } from '../utils/time-utils'
+import { getFileType } from '../utils/image-utils'
+
+export const openai = new OpenAI({
+  apiKey: config.openAIApiKey,
+  timeout: secondsInMs(30),
+  maxRetries: 2,
+})
+
+export const MODEL_ID = config.openAIModelId
+
+export enum OpenAiResponseType {
+  JSON = 'json_object',
+  TEXT = 'text',
+}
+export type OpenAiInput = {
+  prompt: string
+  userMessage: string | Array<OpenAI.ChatCompletionContentPart>
+  responseType?: OpenAiResponseType
+  options?:
+    | Omit<OpenAI.RequestOptions, 'body' | 'method' | 'path' | 'query'>
+    | {}
+}
+
+export type OpenAiResults = {
+  modelId: string
+  results: string | object
+}
+
+export async function invokeModel({
+  prompt,
+  userMessage,
+  responseType = OpenAiResponseType.JSON,
+  options = {},
+}: OpenAiInput): Promise<OpenAiResults> {
+  try {
+    const response = await openai.chat.completions.create(
+      {
+        model: MODEL_ID,
+        messages: [
+          { role: 'system', content: prompt },
+          {
+            role: 'user',
+            content: userMessage,
+          },
+        ],
+        response_format: { type: responseType },
+      },
+      options
+    )
+
+    const results = parseResponse(response, responseType)
+    if (results == null) {
+      throw new Error("Didn't get an expected OpenAI chat response")
+    }
+
+    return {
+      modelId: MODEL_ID,
+      results,
+    }
+  } catch (err) {
+    logger.warn(err, 'An unexpected OpenAI error occurred')
+    throw err
+  }
+}
+
+function parseResponse(
+  response: OpenAI.ChatCompletion,
+  responseType: OpenAiResponseType
+) {
+  if (response?.choices[0]?.message?.content == null) {
+    return null
+  }
+
+  return responseType === OpenAiResponseType.JSON
+    ? JSON.parse(response.choices[0].message.content)
+    : response.choices[0].message.content
+}
+
+export async function invokeVisionModel(
+  systemPrompt: string,
+  image: Buffer | string
+): Promise<string> {
+  const imageUrl =
+    typeof image === 'string'
+      ? image
+      : `data:${getFileType(image)?.mime};base64,${image.toString('base64')}`
+  const userMessage: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    {
+      type: 'image_url',
+      image_url: {
+        url: imageUrl,
+      },
+    },
+  ]
+  const { results } = await invokeModel({
+    prompt: systemPrompt,
+    userMessage,
+    responseType: OpenAiResponseType.TEXT,
+  })
+  if (typeof results !== 'string')
+    throw new Error(
+      'Expected a text response from the vision model when analyzing snapshot'
+    )
+
+  return results
+}

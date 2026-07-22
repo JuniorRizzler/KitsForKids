@@ -1,0 +1,6 @@
+-- migrate:up
+-- DML moved to seed-update 20260709120001_add-ambassador-role so this migration is
+-- safe to run on logical-replication subscribers.
+-- Left intentionally empty: already-applied environments never re-run this body,
+-- and a from-empty build picks up the row from the seed-update.
+-- migrate:down

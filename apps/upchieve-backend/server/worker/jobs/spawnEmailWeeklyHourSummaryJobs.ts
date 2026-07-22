@@ -1,0 +1,74 @@
+import moment from 'moment'
+import 'moment-timezone'
+import { Jobs } from '.'
+import { getVolunteersForWeeklyHourSummary } from '../../models/Volunteer/queries'
+import logger from '../../logger'
+import QueueService from '../../services/QueueService'
+import { Job } from 'bull'
+import { ISOString } from '../../constants'
+import { Ulid } from '../../models/pgUtils'
+
+interface SpawnEmailWeeklyHourSummaryJobsData {
+  startDate?: ISOString
+  endDate?: ISOString
+  volunteerIds?: Ulid[]
+}
+
+// Runs weekly at 6am EST on Monday
+export default async (
+  job?: Job<SpawnEmailWeeklyHourSummaryJobsData>
+): Promise<void> => {
+  const { startDate, endDate, volunteerIds } = job?.data || {}
+
+  //  Monday-Sunday
+  const lastMonday =
+    startDate ||
+    moment().utc().subtract(1, 'weeks').startOf('isoWeek').toISOString()
+  const lastSunday =
+    endDate ||
+    moment().utc().subtract(1, 'weeks').endOf('isoWeek').toISOString()
+
+  const allVolunteers = await getVolunteersForWeeklyHourSummary(lastMonday)
+  const volunteers = volunteerIds
+    ? allVolunteers.filter((v) => volunteerIds.includes(v.id))
+    : allVolunteers
+  const errors: { userId: string; error: unknown }[] = []
+  for (const volunteer of volunteers) {
+    try {
+      await QueueService.add(
+        Jobs.EmailWeeklyHourSummary,
+        {
+          delay: 0,
+          /*
+              By default, all jobs have the highest priority of 1.
+              Since this job can spawn a few thousand jobs that aren't time sensitive,
+              we're setting priority to 3. That way, if we have 10,000 of these jobs
+              in the queue and a `NotifyTutors` job comes in, it can skip to the front
+              of the queue.
+            */
+          priority: 3,
+        },
+        {
+          startDate: lastMonday,
+          endDate: lastSunday,
+          volunteer,
+        }
+      )
+    } catch (error) {
+      errors.push({ userId: volunteer.id, error })
+    }
+  }
+
+  if (errors.length) {
+    logger.error(
+      '%s: Failed to queue %d! jobs: %o',
+      Jobs.SpawnEmailWeeklyHourSummaryJobs,
+      errors.length,
+      {
+        lastMonday,
+        lastSunday,
+        errors,
+      }
+    )
+  }
+}

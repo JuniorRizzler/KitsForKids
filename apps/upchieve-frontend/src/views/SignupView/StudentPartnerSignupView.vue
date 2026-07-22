@@ -1,0 +1,957 @@
+<template>
+  <form-page-template>
+    <div v-if="!showParentGuardianConfirmationPage" class="uc-form">
+      <FormErrors :errors="errors" />
+
+      <h1 v-if="studentPartner.name" class="uc-form-header">
+        Welcome
+        {{
+          isCollegeBoardSearch
+            ? ''
+            : useParentGuardianSignUpFlow
+              ? `Parent/Guardian!`
+              : `Student!`
+        }}
+      </h1>
+      <h1 v-else class="uc-form-header">Welcome to UPchieve!</h1>
+      <p v-if="isCollegeBoardSearch" class="uc-form-text">
+        UPchieve is here to connect you to 100% FREE, online tutoring and
+        college counseling available 24/7! Start chatting with a tutor in less
+        than 5 minutes
+      </p>
+      <p v-else-if="studentPartner.name" class="uc-form-text">
+        Not with {{ studentPartner.name }}?
+        <router-link class="uc-link" to="/sign-up">Click here</router-link>
+      </p>
+      <p v-else class="uc-form-text">
+        We're a free online tutoring platform for high school students.
+      </p>
+
+      <div v-if="isSsoSignup">
+        <div class="uc-form-element">
+          <FormSelect
+            id="grade"
+            :label="`What is your ${getFormLabelIdentifierPossessive} current grade?`"
+            v-model="formData.gradeLevel"
+            placeholder="Select your grade"
+            aria-label="Select your grade"
+            :options="gradeLevels"
+            :is-required="true"
+          />
+        </div>
+
+        <LineDivider text="Sign up with" />
+        <div class="sso-container">
+          <SsoButton
+            v-if="useGoogleSSO"
+            @click="signUpWithSso('google')"
+            class="sso-button"
+            buttonText="Google"
+            :ssoMethod="SsoProvider.GOOGLE"
+          />
+          <SsoButton
+            v-if="useCleverSSO"
+            @click="signUpWithSso('clever')"
+            class="sso-button"
+            buttonText="Clever"
+            :ssoMethod="SsoProvider.CLEVER"
+          />
+          <SsoButton
+            v-if="useClassLinkSSO && isClassLinkSsoEnabled"
+            @click="signUpWithSso('classlink')"
+            class="sso-button"
+            buttonText="ClassLink"
+            :ssoMethod="SsoProvider.CLASSLINK"
+          />
+        </div>
+        <p class="terms-text">
+          By clicking the button above, you agree to our
+          <a href="https://upchieve.org/legal" target="_blank" class="uc-link"
+            >User Agreement</a
+          >.
+        </p>
+      </div>
+
+      <form v-else autocomplete="off" @submit.prevent="registerPartnerStudent">
+        <div v-if="requirePartnerSite" class="uc-form-element">
+          <label
+            for="site"
+            v-bind:class="{
+              error: hasFormValidationError(v$.formData.partnerSite),
+            }"
+          >
+            What is
+            {{ getFormLabelIdentifierPossessive }}
+            site?
+          </label>
+          <v-select-legacy
+            id="site"
+            data-testid="site-select"
+            class="uc-form-select-input"
+            v-model="formData.partnerSite"
+            :placeholder="`Search for ${getFormLabelIdentifierPossessive} site`"
+            v-bind:class="{
+              'uc-form-select-input-invalid': hasFormValidationError(
+                v$.formData.partnerSite
+              ),
+            }"
+            :options="getSortedPartnerSites"
+            searchable="true"
+            :clearable="false"
+            @close="() => v$.formData.partnerSite.$touch()"
+            required
+          ></v-select-legacy>
+        </div>
+
+        <div class="uc-form-element">
+          <label
+            for="firstName"
+            v-bind:class="{
+              error: hasFormValidationError(v$.formData.firstName),
+            }"
+            >What is
+            {{ getFormLabelIdentifierPossessive }}
+            first name?
+          </label>
+          <input
+            id="firstName"
+            class="uc-form-text-input"
+            type="text"
+            :placeholder="`Enter ${getFormLabelIdentifierPossessive} first name`"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.firstName
+              ),
+            }"
+            v-model="formData.firstName"
+            @blur="v$.formData.firstName.$touch"
+            autocomplete="off"
+            required
+          />
+        </div>
+
+        <div class="uc-form-element">
+          <label
+            for="lastName"
+            v-bind:class="{
+              error: hasFormValidationError(v$.formData.lastName),
+            }"
+            >What is
+            {{ getFormLabelIdentifierPossessive }}
+            last name?
+          </label>
+          <input
+            id="lastName"
+            class="uc-form-text-input"
+            type="text"
+            :placeholder="`Enter ${getFormLabelIdentifierPossessive} last name`"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.lastName
+              ),
+            }"
+            v-model="formData.lastName"
+            @blur="v$.formData.lastName.$touch"
+            autocomplete="off"
+            required
+          />
+        </div>
+
+        <div v-if="showHighSchoolCheckbox" class="uc-form-checkbox">
+          <input
+            id="highSchoolCheckbox"
+            v-model="isHighSchoolStudent"
+            type="checkbox"
+          />
+          <label for="highSchoolCheckbox">
+            {{ getFormQuestionIdentifier }}
+            currently a middle or high school student?
+          </label>
+        </div>
+
+        <div class="uc-form-element">
+          <FormSelect
+            id="grade"
+            :label="`What is ${getFormLabelIdentifierPossessive} current grade?`"
+            v-model="formData.gradeLevel"
+            placeholder="Select your grade"
+            aria-label="Select your grade"
+            :options="gradeLevels"
+            :is-required="true"
+          />
+        </div>
+
+        <div v-if="showHighSchoolSelector" class="uc-form-element">
+          <label
+            for="school"
+            v-bind:class="{
+              error: hasFormValidationError(v$.formData.schoolId),
+            }"
+            >What is
+            {{ getFormLabelIdentifierPossessive }}
+            school?</label
+          >
+          <autocomplete
+            id="school"
+            base-class="uc-form-autocomplete-input"
+            :search="autocompleteSchool"
+            :placeholder="`Search for ${getFormLabelIdentifierPossessive} school`"
+            :aria-label="`Search for ${getFormLabelIdentifierPossessive} school`"
+            :get-result-value="getSchoolDisplayName"
+            :debounce-time="500"
+            @submit="handleSelectHighSchool"
+            @blur="v$.formData.schoolId.$touch()"
+            v-bind:class="{
+              'uc-form-autocomplete-input-invalid': hasFormValidationError(
+                v$.formData.schoolId
+              ),
+            }"
+          >
+            <template #result="{ result, props }">
+              <li v-bind="props">
+                <div v-if="result.name" class="result">
+                  {{ result.name }} ({{ result.city }}, {{ result.state }})
+                </div>
+                <a
+                  v-if="result.cantFindSchool"
+                  target="_blank"
+                  href="https://upchieve.org/cant-find-school"
+                >
+                  <div class="result">
+                    {{ CANNOT_FIND_SCHOOL_TEXT }}
+                  </div>
+                </a>
+              </li>
+            </template>
+          </autocomplete>
+        </div>
+
+        <div v-if="showCollegeCheckbox" class="uc-form-checkbox">
+          <input
+            id="collegeCheckbox"
+            v-model="isCollegeStudent"
+            type="checkbox"
+          />
+          <label for="collegeCheckbox">
+            {{ getFormQuestionIdentifier }}
+            currently a college student?
+          </label>
+        </div>
+
+        <div v-if="showCollegeInput" class="uc-form-element">
+          <label
+            for="college"
+            v-bind:class="{
+              error: hasFormValidationError(v$.formData.college),
+            }"
+            >What is
+            {{ getFormLabelIdentifierPossessive }}
+            college?</label
+          >
+          <input
+            id="college"
+            autocomplete="off"
+            class="uc-form-text-input"
+            :placeholder="`Enter ${getFormLabelIdentifierPossessive} college`"
+            type="text"
+            v-model="formData.college"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.college
+              ),
+            }"
+            @blur="v$.formData.college.$touch"
+          />
+        </div>
+
+        <div class="uc-form-element">
+          <div class="uc-row justify-between">
+            <label
+              for="email"
+              v-bind:class="{
+                error: hasFormValidationError(v$.formData.email),
+              }"
+              >What is
+              {{ getFormLabelIdentifierPossessive }}
+              email?</label
+            >
+            <div
+              v-if="hasFormValidationError(v$.formData.email)"
+              class="error-caption"
+            >
+              {{ getFormValidationError(v$.formData.email) }}
+            </div>
+          </div>
+          <input
+            id="email"
+            autocomplete="off"
+            class="uc-form-text-input"
+            type="email"
+            :placeholder="`Enter ${getFormLabelIdentifierPossessive} email address`"
+            v-model="formData.email"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.email
+              ),
+            }"
+            @blur="v$.formData.email.$touch"
+            required
+          />
+        </div>
+
+        <div v-if="useParentGuardianSignUpFlow" class="uc-form-element">
+          <div class="uc-row justify-between">
+            <label
+              for="parent-email"
+              v-bind:class="{
+                error: hasFormValidationError(v$.formData.parentGuardianEmail),
+              }"
+              >What is your email?</label
+            >
+            <div
+              v-if="hasFormValidationError(v$.formData.parentGuardianEmail)"
+              class="error-caption"
+            >
+              {{ getFormValidationError(v$.formData.parentGuardianEmail) }}
+            </div>
+          </div>
+          <input
+            id="parent-email"
+            autocomplete="off"
+            class="uc-form-text-input"
+            type="email"
+            placeholder="Enter your email address"
+            v-model="formData.parentGuardianEmail"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.parentGuardianEmail
+              ),
+            }"
+            @blur="v$.formData.parentGuardianEmail.$touch"
+            required
+          />
+        </div>
+
+        <div v-if="!useParentGuardianSignUpFlow" class="uc-form-element">
+          <div class="uc-row justify-between">
+            <label
+              for="password"
+              v-bind:class="{
+                error: hasFormValidationError(v$.formData.password),
+              }"
+              >Create a password</label
+            >
+            <div
+              v-if="hasFormValidationError(v$.formData.password)"
+              class="error-caption"
+            >
+              {{ getFormValidationError(v$.formData.password) }}
+            </div>
+          </div>
+          <input
+            id="password"
+            autocomplete="new-password"
+            class="uc-form-text-input"
+            type="password"
+            placeholder="Create a password"
+            v-model="formData.password"
+            v-bind:class="{
+              'uc-form-text-input-invalid': hasFormValidationError(
+                v$.formData.password
+              ),
+            }"
+            @blur="v$.formData.password.$touch"
+            required
+          />
+          <div
+            class="metadata"
+            v-bind:class="{
+              'metadata error': hasFormValidationError(v$.formData.password),
+            }"
+          >
+            Must have at least one number, one uppercase letter, one lowercase
+            letter, and be at least 8 characters long.
+          </div>
+        </div>
+
+        <div class="uc-form-element" v-if="requireSignupSource">
+          <FormSelect
+            id="signup-source"
+            label="How did you hear about us?"
+            v-model="formData.signupSourceId"
+            placeholder="Select how you heard about us"
+            :options="isLoadingSignupSource ? [] : signupSourcesOptions"
+            option-text-field="name"
+            :is-required="true"
+            :reduce="(option) => option.id"
+          />
+        </div>
+        <div class="uc-form-element" v-if="shouldShowOtherSignupInput()">
+          <label for="other-signup-source">How did you hear about us?</label>
+          <input
+            id="other-signup-source"
+            type="text"
+            autocomplete="off"
+            class="uc-form-text-input"
+            v-model="formData.otherSignupSource"
+            autofocus
+          />
+        </div>
+
+        <button
+          class="uc-form-button"
+          type="submit"
+          :disabled="isSignUpButtonDisabled() ? true : null"
+        >
+          Sign Up
+        </button>
+        <p class="terms-text">
+          By clicking the button above, you agree to our
+          <a href="https://upchieve.org/legal" target="_blank" class="uc-link"
+            >User Agreement</a
+          >.
+        </p>
+      </form>
+    </div>
+    <div v-if="showParentGuardianConfirmationPage" class="uc-form">
+      <div class="uc-column justify-center items-center h-full center">
+        <verification-badge />
+        <h1>You're all set!</h1>
+        <p>
+          An account for
+          <span data-e2e-ignore>{{ this.formData.firstName }}</span> has been
+          created.
+        </p>
+        <p>
+          We have sent an email to
+          <span id="ph-no-capture">{{ this.formData.email }}</span> to set a
+          password.
+        </p>
+      </div>
+    </div>
+  </form-page-template>
+</template>
+
+<script>
+import { mapGetters } from 'vuex'
+import { useVuelidate } from '@vuelidate/core'
+import { email, helpers, required, requiredIf } from '@vuelidate/validators'
+import LoggerService from '@/services/LoggerService'
+import Autocomplete from '@trevoreyre/autocomplete-vue'
+
+import FormPageTemplate from '@/components/FormPageTemplate.vue'
+import FormErrors from '@/components/FormErrors.vue'
+import FormSelect from '@/components/FormInputs/FormSelect.vue'
+import SsoButton from '@/components/SsoButton.vue'
+import AuthService from '@/services/AuthService'
+import NetworkService from '@/services/NetworkService'
+import AnalyticsService from '@/services/AnalyticsService'
+import { SsoProvider } from '@/services/SsoService'
+import { backOff } from 'exponential-backoff'
+import { EVENTS, GRADES, INELIGIBLE_LOCAL_STORAGE_KEY } from '@/consts'
+import config from '../../config'
+import VerificationBadge from '@/assets/verification.svg'
+import * as signupUtils from '@/utils/signup-utils'
+import LineDivider from '@/components/LineDivider.vue'
+
+export default {
+  name: 'student-partner-signup-view',
+  components: {
+    FormPageTemplate,
+    FormErrors,
+    Autocomplete,
+    VerificationBadge,
+    SsoButton,
+    FormSelect,
+    LineDivider,
+  },
+  setup() {
+    return { v$: useVuelidate(), SsoProvider }
+  },
+  validations() {
+    return {
+      formData: {
+        partnerSite: {
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(() => this.requirePartnerSite)
+          ),
+        },
+        firstName: { required: helpers.withMessage('Required', required) },
+        lastName: { required: helpers.withMessage('Required', required) },
+        schoolId: {
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(this.showHighSchoolSelector)
+          ),
+        },
+        college: {
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(this.showCollegeInput)
+          ),
+        },
+        email: {
+          isValidEmail: helpers.withMessage('Not a valid email address', email),
+          required: helpers.withMessage('Required', required),
+        },
+        password: {
+          isPasswordValid: helpers.regex(this.PASSWORD_PATTERN),
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(() => !this.useParentGuardianSignUpFlow)
+          ),
+        },
+        parentGuardianEmail: {
+          isValidEmail: helpers.withMessage('Not a valid email address', email),
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(() => this.useParentGuardianSignUpFlow)
+          ),
+        },
+        signupSourceId: {
+          required: helpers.withMessage(
+            'Required',
+            requiredIf(() => this.requireSignupSource)
+          ),
+        },
+        gradeLevel: {
+          required: helpers.withMessage('Required', required),
+        },
+      },
+    }
+  },
+  beforeRouteEnter(to, from, next) {
+    const partnerId = to.params.partnerId
+
+    NetworkService.getStudentPartner(partnerId)
+      .then((res) => {
+        const studentPartner = res.data.studentPartner
+        if (!studentPartner) return next('/sign-up')
+        if (studentPartner.deactivated) {
+          AnalyticsService.captureEvent(
+            EVENTS.STUDENT_VISITED_DEACTIVATED_PARTNER,
+            { partner: partnerId }
+          )
+          return next('/sign-up')
+        }
+        return next((_this) => (_this.studentPartner = studentPartner))
+      })
+      .catch((err) => {
+        if (err.status !== 404) {
+          // we shouldn't get 422 here, since semantics of GET request are expected
+          // to be correct regardless of user input
+          LoggerService.noticeError(err)
+        }
+        return next('/sign-up')
+      })
+  },
+  async mounted() {
+    localStorage.removeItem('isSSOSignUpRedirect')
+    localStorage.removeItem(INELIGIBLE_LOCAL_STORAGE_KEY)
+    const params = this.$route.query
+    if (this.shouldUseGoogleSSO(params)) {
+      this.useGoogleSSO = true
+    }
+    if (this.shouldUseCleverSSO(params)) {
+      this.useCleverSSO = true
+    }
+    if (this.shouldUseClassLinkSSO(params)) {
+      this.useClassLinkSSO = true
+    }
+    if (this.shouldUseParentGuardianSignUpFlow(params)) {
+      this.useParentGuardianSignUpFlow = true
+    }
+    if (this.isFailureRedirect(params)) {
+      this.errors.push(params['error'] || 'Failed to sign up with Google.')
+    }
+  },
+  async created() {
+    await this.getSignupSources()
+  },
+  data() {
+    return {
+      useGoogleSSO: false,
+      useCleverSSO: false,
+      useClassLinkSSO: false,
+      useParentGuardianSignUpFlow: false,
+      showParentGuardianConfirmationPage: false,
+      gradeLevels: GRADES,
+      studentPartner: {
+        name: '',
+        highSchoolSignup: false,
+        collegeSignup: false,
+        schoolSignupRequired: false,
+        sites: [],
+      },
+      isHighSchoolStudent: false,
+      isCollegeStudent: false,
+      formData: {
+        college: '',
+        email: '',
+        firstName: '',
+        lastName: '',
+        otherSignupSource: '',
+        partnerSite: undefined,
+        password: '',
+        parentGuardianEmail: '',
+        schoolId: undefined,
+        signupSourceId: undefined,
+        gradeLevel: '',
+      },
+      errors: [],
+      serverErrorMsg: '',
+      signupSourcesOptions: [],
+      isLoadingSignupSource: false,
+      isSubmittingForm: false,
+    }
+  },
+  computed: {
+    ...mapGetters({
+      isClassLinkSsoEnabled: 'featureFlags/isClassLinkSsoEnabled',
+    }),
+    PASSWORD_PATTERN() {
+      return /(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.{8,})/
+    },
+    CANNOT_FIND_SCHOOL_TEXT() {
+      return `Can't find your school?`
+    },
+    trimGradeLevel() {
+      // extracting the first word out of the gradeLevels
+      // example: "8th grade" --> "8th"
+      return this.formData.gradeLevel.split(' ')[0]
+    },
+
+    isSsoSignup() {
+      return (
+        (this.useGoogleSSO || this.useCleverSSO || this.useClassLinkSSO) &&
+        !this.useParentGuardianSignUpFlow
+      )
+    },
+
+    showHighSchoolCheckbox() {
+      // Don't show if high school input is disabled
+      if (!this.studentPartner.highSchoolSignup) return false
+
+      // Don't show if high school input is required
+      if (this.onlyHighSchoolRequired) return false
+
+      // Only show if high school input is enabled but not required, i.e. optional
+      return true
+    },
+
+    showHighSchoolSelector() {
+      // No high school input
+      if (!this.studentPartner.highSchoolSignup) return false
+
+      // Require high school input
+      if (this.onlyHighSchoolRequired) return true
+
+      // Optional high school input, so show if the checkbox is selected
+      return this.isHighSchoolStudent
+    },
+
+    showCollegeCheckbox() {
+      // Don't show if high school input is disabled
+      if (!this.studentPartner.collegeSignup) return false
+
+      // Don't show if high school input is required
+      if (this.onlyCollegeRequired) return false
+
+      // Only show if high school input is enabled but not required, i.e. optional
+      return true
+    },
+
+    showCollegeInput() {
+      // Don't show if college input is disabled
+      if (!this.studentPartner.collegeSignup) return false
+
+      // Show if college input is required
+      if (this.onlyCollegeRequired) return true
+
+      // Only show if high school input is enabled but not required, i.e. optional
+      return this.isCollegeStudent
+    },
+
+    requirePartnerSite() {
+      return !!this.studentPartner.sites
+    },
+    requireSignupSource() {
+      return this.studentPartner.isManuallyApproved
+    },
+
+    onlyHighSchoolRequired() {
+      return (
+        this.studentPartner.highSchoolSignup &&
+        !this.studentPartner.collegeSignup &&
+        this.studentPartner.schoolSignupRequired
+      )
+    },
+
+    onlyCollegeRequired() {
+      return (
+        this.studentPartner.collegeSignup &&
+        !this.studentPartner.highSchoolSignup &&
+        this.studentPartner.schoolSignupRequired
+      )
+    },
+
+    getFormQuestionIdentifier() {
+      return signupUtils.getFormQuestionIdentifier(
+        this.useParentGuardianSignUpFlow
+      )
+    },
+    getFormLabelIdentifierPossessive() {
+      return signupUtils.getFormLabelIdentifierPossessive(
+        this.useParentGuardianSignUpFlow
+      )
+    },
+
+    getSortedPartnerSites() {
+      return Array.from(this.studentPartner.sites).sort()
+    },
+    partner() {
+      return this.$route.params.partnerId
+    },
+    isCollegeBoardSearch() {
+      return this.partner === 'college-board-search'
+    },
+  },
+  methods: {
+    isFailureRedirect(params) {
+      return Object.keys(params).includes('error')
+    },
+    shouldUseGoogleSSO(params) {
+      return (
+        params['sso'] === SsoProvider.GOOGLE ||
+        params['provider'] === SsoProvider.GOOGLE
+      )
+    },
+    shouldUseCleverSSO(params) {
+      return (
+        params['sso'] === SsoProvider.CLEVER ||
+        params['provider'] === SsoProvider.CLEVER
+      )
+    },
+    shouldUseClassLinkSSO(params) {
+      return (
+        params['sso'] === SsoProvider.CLASSLINK ||
+        params['provider'] === SsoProvider.CLASSLINK
+      )
+    },
+    shouldUseParentGuardianSignUpFlow(params) {
+      for (const key in params) {
+        if (key.trim() === 'parent') {
+          return true
+        }
+      }
+      return false
+    },
+    autocompleteSchool(input) {
+      this.formData.schoolId = undefined
+
+      return new Promise((resolve) => {
+        if (input.length < 3) {
+          return resolve([])
+        }
+
+        const cantFindSchoolItem = {
+          cantFindSchool: true,
+        }
+
+        NetworkService.searchSchool({ query: input })
+          .then((response) => response.data.results)
+          .then((schools) => {
+            schools.push(cantFindSchoolItem)
+            resolve(schools)
+          })
+      })
+    },
+
+    getSchoolDisplayName(school) {
+      if (school.cantFindSchool) {
+        return this.CANNOT_FIND_SCHOOL_TEXT
+      }
+      return `${school.name} (${school.city}, ${school.state})`
+    },
+
+    handleSelectHighSchool(school) {
+      this.formData.schoolId = school.upchieveId
+    },
+    shouldShowOtherSignupInput() {
+      if (this.isLoadingSignupSource || !this.signupSourcesOptions) {
+        return false
+      }
+      const otherOption = this.signupSourcesOptions.find(
+        (s) => s.name === 'Other'
+      )
+      return otherOption && otherOption.id === this.formData.signupSourceId
+    },
+
+    hasFormErrors() {
+      this.errors = []
+
+      // If school sign up is required and both student and college options are true the student must select one
+      if (
+        this.studentPartner.schoolSignupRequired &&
+        this.studentPartner.highSchoolSignup &&
+        this.studentPartner.collegeSignup &&
+        !this.isHighSchoolStudent &&
+        !this.isCollegeStudent
+      )
+        this.errors.push(
+          "You must select if you're a high school or college student."
+        )
+
+      if (this.isHighSchoolStudent && !this.formData.schoolId) {
+        this.errors.push('You must select your high school.')
+      }
+
+      if (this.isCollegeStudent && !this.formData.college) {
+        this.errors.push('You must enter a college.')
+      }
+
+      if (
+        this.studentPartner.isManuallyApproved &&
+        !this.formData.signupSourceId
+      ) {
+        this.errors.push('Please select an option for how you heard about us.')
+      }
+
+      return !!this.errors.length
+    },
+
+    async getSignupSources() {
+      this.isLoadingSignupSource = true
+      try {
+        const res = await backOff(() =>
+          NetworkService.getStudentSignupSources()
+        )
+        this.signupSourcesOptions = res.data.signupSources
+      } catch (err) {
+        LoggerService.noticeError(err)
+      } finally {
+        this.isLoadingSignupSource = false
+      }
+    },
+
+    registerPartnerStudent() {
+      this.isSubmittingForm = true
+
+      if (this.hasFormErrors()) {
+        return
+      }
+
+      AuthService.registerStudent({
+        college: this.formData.college,
+        email: this.formData.email,
+        firstName: this.formData.firstName,
+        lastName: this.formData.lastName,
+        otherSignupSource: this.formData.otherSignupSource,
+        parentGuardianEmail: this.formData.parentGuardianEmail,
+        password: this.formData.password,
+        schoolId: this.formData.schoolId,
+        signupSourceId: this.formData.signupSourceId,
+        studentPartnerOrgKey: this.$route.params.partnerId,
+        studentPartnerOrgSiteName: this.formData.partnerSite,
+        gradeLevel: this.trimGradeLevel,
+      })
+        .then(() => {
+          if (this.useParentGuardianSignUpFlow) {
+            this.showParentGuardianConfirmationPage = true
+          } else {
+            this.$router.push('/verify')
+          }
+        })
+        .catch((err) => {
+          this.isSubmittingForm = false
+          this.errors.push(
+            err?.response?.data?.err ?? 'Failed: Please try again.'
+          )
+          if (err?.response?.status !== 422) {
+            LoggerService.noticeError(err)
+          }
+        })
+    },
+
+    signUpWithSso(provider) {
+      this.captureSsoClickEvent(provider)
+
+      // TODO: Early exit if grade isn't selected and add disabled to SSOButton until grade is selected?
+      localStorage.setItem('isSSOSignUpRedirect', true)
+      const data = {
+        errorRedirect: this.$route.path,
+        gradeLevel: this.trimGradeLevel,
+        isLogin: false,
+        provider,
+        studentPartnerOrgKey: this.studentPartner.key,
+      }
+      const params = new URLSearchParams(data).toString()
+      const url = `${config.serverRoot}/auth/sso?${params}`
+      window.location.replace(url)
+    },
+
+    captureSsoClickEvent(provider) {
+      if (provider === SsoProvider.GOOGLE) {
+        AnalyticsService.captureEvent(
+          EVENTS.PARTNER_STUDENT_CLICKED_SIGN_UP_WITH_GOOGLE
+        )
+      }
+      if (provider === SsoProvider.CLEVER) {
+        AnalyticsService.captureEvent(
+          EVENTS.PARTNER_STUDENT_CLICKED_SIGN_UP_WITH_CLEVER
+        )
+      }
+      if (provider === SsoProvider.CLASSLINK) {
+        AnalyticsService.captureEvent(
+          EVENTS.PARTNER_STUDENT_CLICKED_SIGN_UP_WITH_CLASSLINK
+        )
+      }
+    },
+
+    hasFormValidationError(el) {
+      return !!el.$errors.length
+    },
+    getFormValidationError(el) {
+      return el.$errors.map((e) => e.$message).join(', ')
+    },
+
+    isSignUpButtonDisabled() {
+      return (
+        this.v$.formData.$errors.length ||
+        this.v$.formData.$silentErrors.length ||
+        this.isSubmittingForm
+      )
+    },
+  },
+}
+</script>
+
+<style lang="scss" scoped>
+.uc-form-text {
+  margin-top: 10px;
+}
+
+.uc-form-checkbox {
+  margin-top: 10px;
+}
+
+.break-line {
+  background-color: $c-secondary-grey;
+  height: 1px;
+}
+
+.or-text {
+  color: $c-secondary-grey;
+  font-style: italic;
+  padding: 0 10px;
+  margin: 0;
+}
+
+.terms-text {
+  font-size: 14px;
+  font-style: italic;
+  margin: 4px 0;
+  text-align: center;
+}
+</style>

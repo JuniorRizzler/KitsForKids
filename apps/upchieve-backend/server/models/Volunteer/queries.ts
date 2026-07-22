@@ -1,0 +1,1839 @@
+import {
+  getAnalyticsClient,
+  getClient,
+  getRoClient,
+  runInTransaction,
+  TransactionClient,
+} from '../../db'
+import * as pgQueries from './pg.queries'
+import {
+  makeRequired,
+  makeSomeOptional,
+  Ulid,
+  getDbUlid,
+  generateReferralCode,
+  makeSomeRequired,
+  Uuid,
+} from '../pgUtils'
+import {
+  RepoCreateError,
+  RepoDeleteError,
+  RepoReadError,
+  RepoUpdateError,
+} from '../Errors'
+import { Availability } from '../Availability/types'
+import { getAvailabilityForVolunteer } from '../Availability'
+import {
+  Quizzes,
+  Sponsorship,
+  TextableVolunteer,
+  UserTrainingCourse,
+  VolunteerOccupations,
+  VolunteerProfileUpdate,
+  VolunteersForAnalyticsReport,
+  VolunteerSubject,
+} from './types'
+import config from '../../config'
+import _ from 'lodash'
+import {
+  ACCOUNT_USER_ACTIONS,
+  PHOTO_ID_STATUS,
+  USER_BAN_TYPES,
+  USER_ROLES,
+} from '../../constants'
+import {
+  AssociatedPartnersAndSchools,
+  getAssociatedPartnersAndSchools,
+} from '../AssociatedPartner'
+import { UniqueStudentsHelped } from '.'
+import { insertUserRoleByUserId, UserRole } from '../User'
+import { getVolunteerPartnerOrgIdByKey } from '../VolunteerPartnerOrg'
+import { ReportNoDataFoundError } from '../../services/ReportService'
+
+export type VolunteerContactInfo = {
+  id: Ulid
+  email: string
+  phone?: string
+  firstName: string
+  lastName: string
+  volunteerPartnerOrg?: string
+  approved?: boolean
+}
+
+export type VolunteerContactInfoWithPhoneRequired = Omit<
+  VolunteerContactInfo,
+  'phone'
+> & {
+  phone: string
+}
+
+export async function getVolunteerContactInfoById(
+  userId: Ulid,
+  filters?: {
+    banned?: boolean
+    deactivated?: boolean
+    testUser?: boolean
+  }
+): Promise<VolunteerContactInfo | undefined> {
+  try {
+    const banned = filters?.banned ?? null
+    const deactivated = filters?.deactivated ?? null
+    const testUser = filters?.testUser ?? null
+    const result = await pgQueries.getVolunteerContactInfoById.run(
+      { userId, banned, deactivated, testUser },
+      getClient()
+    )
+    if (!result.length) return
+    const ret = makeSomeOptional(result[0], [
+      'volunteerPartnerOrg',
+      'phone',
+      'approved',
+    ])
+    ret.email = ret.email.toLowerCase()
+    return ret
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getSubjectsForVolunteer(
+  userId: Ulid,
+  tc?: TransactionClient
+) {
+  try {
+    const result = await pgQueries.getSubjectsForVolunteer.run(
+      { userId },
+      tc ?? getClient()
+    )
+    const subjects = result.map((v) => makeRequired(v).subject)
+    return subjects
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteerContactInfoByIds(
+  userIds: Ulid[],
+  client?: TransactionClient
+): Promise<VolunteerContactInfo[]> {
+  const dbClient = client ?? getClient()
+  try {
+    const result = await pgQueries.getVolunteerContactInfoByIds.run(
+      { userIds },
+      dbClient
+    )
+    return result.map((v) => {
+      const ret = makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersForBlackoutOver(
+  startDate: Date
+): Promise<VolunteerContactInfo[]> {
+  try {
+    const result = await pgQueries.getVolunteersForBlackoutOver.run(
+      { startDate },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerContactAndAvailability = VolunteerContactInfo & {
+  availability: Availability
+}
+export async function getVolunteerForQuickTips(
+  userId: Ulid
+): Promise<VolunteerContactAndAvailability | undefined> {
+  try {
+    const vResult = await pgQueries.getVolunteerForQuickTips.run(
+      {
+        userId,
+      },
+      getClient()
+    )
+    if (!vResult.length) return
+    const volunteer = makeSomeOptional(vResult[0], [
+      'volunteerPartnerOrg',
+      'phone',
+    ])
+    const availability = await getAvailabilityForVolunteer(userId)
+    volunteer.email = volunteer.email.toLowerCase()
+    return {
+      ...volunteer,
+      availability,
+    }
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getPartnerVolunteerForLowHours(
+  userId: Ulid
+): Promise<VolunteerContactAndAvailability | undefined> {
+  try {
+    const vResult = await pgQueries.getPartnerVolunteerForLowHours.run(
+      {
+        userId,
+      },
+      getClient()
+    )
+    if (!vResult.length) return
+    const volunteer = makeSomeOptional(vResult[0], ['phone']) // volunteerPartnerOrg must exist
+    volunteer.email = volunteer.email.toLowerCase()
+    const availability = await getAvailabilityForVolunteer(userId)
+    return {
+      ...volunteer,
+      availability,
+    }
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerTypeMap<T> = {
+  [key: Ulid]: T
+}
+export type VolunteerQuizMap = VolunteerTypeMap<Quizzes>
+export async function getQuizzesForVolunteers(
+  userIds: Ulid[],
+  client: TransactionClient = getClient()
+): Promise<VolunteerQuizMap> {
+  try {
+    const result = await pgQueries.getQuizzesForVolunteers.run(
+      { userIds },
+      client
+    )
+    const rows = result.map((v) => makeRequired(v))
+    const rowsByUser = _.groupBy(rows, (v) => v.userId)
+    const map: VolunteerQuizMap = {}
+    for (const user of userIds) {
+      const temp: Quizzes = {}
+      const rows = rowsByUser[user] || []
+      for (const row of rows) {
+        temp[row.name] = {
+          passed: row.passed,
+          tries: row.tries,
+          lastAttemptedAt: row.lastAttemptedAt,
+        }
+      }
+      map[user] = temp
+    }
+    return map
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getCertificationsForVolunteer(
+  userIds: Ulid[],
+  client: TransactionClient = getClient()
+): Promise<VolunteerQuizMap> {
+  try {
+    const result = await pgQueries.getCertificationsForVolunteer.run(
+      { userIds },
+      client
+    )
+    const rows = result.map((v) => makeRequired(v))
+    const rowsByUser = _.groupBy(rows, (v) => v.userId)
+    const map: VolunteerQuizMap = {}
+    for (const user of userIds) {
+      const temp: Quizzes = {}
+      const rows = rowsByUser[user] || []
+      for (const row of rows) {
+        temp[row.name] = {
+          passed: true,
+          tries: 1,
+          lastAttemptedAt: row.lastAttemptedAt,
+        }
+      }
+      map[user] = temp
+    }
+    return map
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getActiveQuizzesForVolunteers(
+  userIds: Ulid[],
+  client: TransactionClient = getClient()
+): Promise<VolunteerQuizMap> {
+  try {
+    const result = await pgQueries.getActiveQuizzesForVolunteers.run(
+      { userIds },
+      client
+    )
+    const rows = result.map((v) => makeRequired(v))
+    const rowsByUser = _.groupBy(rows, (v) => v.userId)
+    const map: VolunteerQuizMap = {}
+    for (const user of userIds) {
+      const temp: Quizzes = {}
+      const rows = rowsByUser[user] || []
+      for (const row of rows) {
+        temp[row.name] = {
+          passed: row.passed,
+          tries: row.tries,
+          lastAttemptedAt: row.lastAttemptedAt,
+        }
+      }
+      map[user] = temp
+    }
+    return map
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerForWeeklyHourSummary = Omit<
+  VolunteerContactInfo,
+  'phone'
+> & {
+  sentHourSummaryIntroEmail: boolean
+}
+
+export async function getVolunteersForWeeklyHourSummary(
+  startOfWeek: string
+): Promise<VolunteerForWeeklyHourSummary[]> {
+  try {
+    const result = await pgQueries.getVolunteersForWeeklyHourSummary.run(
+      { startOfWeek },
+      getClient()
+    )
+    return result.map((v) => makeSomeOptional(v, ['volunteerPartnerOrg']))
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function updateVolunteerHourSummaryIntroById(
+  userId: Ulid
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerHourSummaryIntroById.run(
+      { userId },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateTimezoneByUserId(
+  userId: Ulid,
+  timezone?: string,
+  tc?: TransactionClient
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateTimezoneByUserId.run(
+      { userId, timezone },
+      tc || getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function getVolunteerIdsForElapsedAvailability(): Promise<Ulid[]> {
+  try {
+    const result = await pgQueries.getVolunteerIdsForElapsedAvailability.run(
+      undefined,
+      getClient()
+    )
+    return result.map((v) => makeRequired(v).userId)
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerForTotalHours = Pick<VolunteerContactInfo, 'id'> & {
+  quizzes: Quizzes
+}
+export async function getVolunteersForTotalHours(): Promise<
+  VolunteerForTotalHours[]
+> {
+  try {
+    const result = await pgQueries.getVolunteersForTotalHours.run(
+      { targetPartnerOrgs: config.customVolunteerPartnerOrgs },
+      getClient()
+    )
+    const rows = result.map((v) => makeRequired(v))
+    const quizzes = await getQuizzesForVolunteers(rows.map((v) => v.id))
+    return rows.map((v) => ({
+      ...v,
+      quizzes: quizzes[v.id],
+    }))
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerForOnboarding = Pick<
+  VolunteerContactInfo,
+  'id' | 'email' | 'firstName'
+> & {
+  onboarded: boolean
+  approved: boolean
+  hasCompletedUpchieve101: boolean
+  subjects: string[]
+  country?: string
+  volunteerPartnerOrgKey?: string
+}
+export async function getVolunteerForOnboardingById(
+  tc: TransactionClient = getClient(),
+  userId: Ulid,
+  filters: {
+    includeDeactivated: boolean
+  } = { includeDeactivated: false }
+): Promise<
+  Omit<VolunteerForOnboarding, 'hasCompletedUpchieve101'> | undefined
+> {
+  try {
+    const result = await pgQueries.getVolunteerForOnboardingById.run(
+      {
+        userId,
+        deactivated: filters.includeDeactivated ? null : false,
+      },
+      tc
+    )
+    if (!result.length) return
+    const volunteer = makeSomeOptional(result[0], [
+      'availabilityLastModifiedAt',
+      'country',
+      'volunteerPartnerOrgKey',
+    ])
+    if (volunteer.email) {
+      volunteer.email = volunteer.email.toLowerCase()
+    }
+    return volunteer
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerForTelecomReport = Omit<VolunteerContactInfo, 'phone'> & {
+  quizzes: Quizzes
+}
+// TODO: break out anything that uses RO client into their own repo
+export async function getVolunteersForTelecomReport(
+  partnerOrg: string
+): Promise<VolunteerForTelecomReport[]> {
+  try {
+    const result = await pgQueries.getVolunteersForTelecomReport.run(
+      { partnerOrg },
+      getAnalyticsClient()
+    )
+    const rows = result.map((v) => makeSomeOptional(v, ['volunteerPartnerOrg']))
+    const quizzes = await getQuizzesForVolunteers(rows.map((v) => v.id))
+    return rows.map((v) => ({
+      ...v,
+      quizzes: quizzes[v.id],
+    }))
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersNotifiedBySessionId(
+  sessionId: Ulid
+): Promise<Ulid[]> {
+  try {
+    const result = await pgQueries.getVolunteersNotifiedBySessionId.run(
+      { sessionId },
+      getClient()
+    )
+    return result.map((v) => makeRequired(v).userId)
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+type VolunteerAndReference = {
+  volunteerId: Ulid
+  referenceEmail: string
+}
+export async function getVolunteerByReference(
+  referenceId: Ulid
+): Promise<VolunteerAndReference | undefined> {
+  try {
+    const result = await pgQueries.getVolunteerByReference.run(
+      { referenceId },
+      getClient()
+    )
+    if (!result.length) return
+    const ret = makeRequired(result[0])
+    ret.referenceEmail = ret.referenceEmail.toLowerCase()
+    return ret
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type ReferenceData = {
+  firstName: string
+  lastName: string
+  email: string
+}
+export async function addVolunteerReferenceById(
+  volunteerId: Ulid,
+  reference: ReferenceData
+): Promise<void> {
+  try {
+    reference.email = reference.email.toLowerCase()
+    const result = await pgQueries.addVolunteerReferenceById.run(
+      {
+        id: getDbUlid(),
+        userId: volunteerId,
+        ...reference,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoCreateError('Insert query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoCreateError) throw err
+    throw new RepoCreateError(err)
+  }
+}
+
+export type ReferenceSubmission = {
+  affiliation: string | undefined
+  relationshipLength: string | undefined
+  rejectionReason: string | undefined
+  additionalInfo: string | undefined
+  patient: number | undefined
+  positiveRoleModel: number | undefined
+  agreeableAndApproachable: number | undefined
+  communicatesEffectively: number | undefined
+  trustworthyWithChildren: number | undefined
+}
+export async function updateVolunteerReferenceSubmission(
+  referenceId: Ulid,
+  referenceSubmission: ReferenceSubmission
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerReferenceSubmission.run(
+      { referenceId, ...referenceSubmission },
+      getClient()
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export type InactiveVolunteersAggregation = {
+  inactiveThirtyDays: VolunteerContactInfo[]
+  inactiveSixtyDays: VolunteerContactInfo[]
+  inactiveNinetyDays: VolunteerContactInfo[]
+}
+
+export async function getInactiveVolunteers(
+  thirtyDaysAgoStartOfDay: Date,
+  thirtyDaysAgoEndOfDay: Date,
+  sixtyDaysAgoStartOfDay: Date,
+  sixtyDaysAgoEndOfDay: Date,
+  ninetyDaysAgoStartOfDay: Date,
+  ninetyDaysAgoEndOfDay: Date
+): Promise<InactiveVolunteersAggregation> {
+  try {
+    const thirtyResult = await pgQueries.getInactiveVolunteers.run(
+      { start: thirtyDaysAgoStartOfDay, end: thirtyDaysAgoEndOfDay },
+      getClient()
+    )
+    const thirties = thirtyResult.map((v) =>
+      makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+    )
+    const sixtyResult = await pgQueries.getInactiveVolunteers.run(
+      { start: sixtyDaysAgoStartOfDay, end: sixtyDaysAgoEndOfDay },
+      getClient()
+    )
+    const sixties = sixtyResult.map((v) =>
+      makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+    )
+    const ninetyResult = await pgQueries.getInactiveVolunteers.run(
+      { start: ninetyDaysAgoStartOfDay, end: ninetyDaysAgoEndOfDay },
+      getClient()
+    )
+    const nineties = ninetyResult.map((v) =>
+      makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+    )
+
+    return {
+      inactiveThirtyDays: thirties,
+      inactiveSixtyDays: sixties,
+      inactiveNinetyDays: nineties,
+    }
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function updateVolunteerReferenceSentById(
+  referenceId: Ulid
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerReferenceSentById.run(
+      {
+        referenceId,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerPending(
+  userId: Ulid,
+  approved: boolean,
+  photoIdStatus: string
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerPending.run(
+      { userId, approved, status: photoIdStatus.toLowerCase() },
+      getClient()
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteersReadyToCoachByIds(
+  userIds: Ulid[]
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteersReadyToCoachByIds.run(
+      {
+        userIds,
+      },
+      getClient()
+    )
+    const errors: string[] = []
+    for (const row of result) {
+      try {
+        if (!makeRequired(row).ok)
+          throw new Error('Updated row did not return ok')
+      } catch (err) {
+        errors.push((err as Error).message)
+      }
+    }
+    if (errors.length) throw new RepoUpdateError(errors.join('\n'))
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerElapsedAvailabilityById(
+  userId: Ulid,
+  elapsedAvailability: number
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerElapsedAvailabilityById.run(
+      {
+        userId,
+        elapsedAvailability,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function setVolunteerElapsedAvailabilityById(
+  userId: Ulid,
+  elapsedAvailability: number
+): Promise<void> {
+  try {
+    const result = await pgQueries.setVolunteerElapsedAvailabilityById.run(
+      {
+        userId,
+        elapsedAvailability,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new Error('Update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerTotalHoursById(
+  userId: Ulid,
+  totalHours: number
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerTotalHoursById.run(
+      {
+        userId,
+        totalHours: String(totalHours),
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export type TrainingCourse = {
+  userId: Ulid
+  complete: boolean
+  trainingCourse: string
+  progress: number
+  completedMaterials: string[]
+  createdAt: Date
+  updatedAt: Date
+  // legacy names for frontend
+  isComplete: boolean
+}
+type VolunteerTrainingCourses = { [key: string]: TrainingCourse }
+export async function getVolunteerTrainingCourses(
+  userId: Ulid,
+  tc?: TransactionClient
+): Promise<VolunteerTrainingCourses> {
+  try {
+    const result = await pgQueries.getVolunteerTrainingCourses.run(
+      { userId },
+      tc ?? getClient()
+    )
+    const map: VolunteerTrainingCourses = {}
+    for (const row of result) {
+      const temp = { ...makeRequired(row) }
+      map[temp.trainingCourse] = {
+        ...temp,
+        isComplete: temp.complete,
+      }
+    }
+    return map
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function updateVolunteerTrainingById(
+  userId: Ulid,
+  trainingCourse: string,
+  requiredMaterialKeys: string[],
+  materialKey: string,
+  tc?: TransactionClient
+): Promise<UserTrainingCourse> {
+  try {
+    const results = await pgQueries.updateVolunteerTrainingById.run(
+      {
+        userId,
+        trainingCourse,
+        requiredMaterialKeys,
+        materialKey,
+      },
+      tc ?? getClient()
+    )
+    if (!results.length)
+      throw new RepoUpdateError('Update query did not return ok')
+    return makeRequired(results[0])
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerPhotoIdById(
+  userId: Ulid,
+  key: string,
+  status: PHOTO_ID_STATUS
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerPhotoIdById.run(
+      {
+        userId,
+        key,
+        status,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerSentInactive30DayEmail(
+  userId: Ulid
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerSentInactive30DayEmail.run(
+      {
+        userId,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerSentInactive60DayEmail(
+  userId: Ulid
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerSentInactive60DayEmail.run(
+      {
+        userId,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerSentInactive90DayEmail(
+  userId: Ulid
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerSentInactive90DayEmail.run(
+      {
+        userId,
+      },
+      getClient()
+    )
+    if (!(result.length && makeRequired(result[0]).ok))
+      throw new RepoUpdateError('Update query did not return ok')
+  } catch (err) {
+    if (err instanceof RepoUpdateError) throw err
+    throw new RepoUpdateError(err)
+  }
+}
+
+export type UnsentReference = {
+  id: Ulid
+  firstName: string
+  lastName: string
+  email: string
+}
+export type VolunteersForEmailReference = VolunteerContactInfo & {
+  references: UnsentReference[]
+}
+export async function getVolunteersForEmailReference(): Promise<
+  VolunteersForEmailReference[]
+> {
+  try {
+    const result = await pgQueries.getVolunteerUnsentReferences.run(
+      undefined,
+      getClient()
+    )
+    const references = result.map((v) => makeRequired(v))
+    const volunteers = await getVolunteerContactInfoByIds(
+      references.map((v) => v.userId)
+    )
+    const map: VolunteerTypeMap<(typeof references)[number][]> = _.groupBy(
+      references,
+      (v) => v.userId
+    )
+    return volunteers.map((v) => {
+      const references = []
+      for (const ref of map[v.id]) {
+        references.push({
+          id: ref.id,
+          firstName: ref.firstName,
+          lastName: ref.lastName,
+          email: ref.email.toLowerCase(),
+        })
+      }
+      return {
+        ...v,
+        references: references,
+      }
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type ReferenceContactInfo = {
+  id: Ulid
+  status: string
+  email: string
+  firstName: string
+  lastName: string
+  affiliation?: string
+  additionalInfo?: string
+  agreeableAndApproachable?: number
+  communicatesEffectively?: number
+  patient?: number
+  positiveRoleModel?: number
+  rejectionReason?: string
+  relationshipLength?: string
+  trustworthyWithChildren?: number
+}
+
+export async function getReferencesByVolunteer(
+  userId: Ulid,
+  client: TransactionClient = getClient()
+): Promise<ReferenceContactInfo[]> {
+  try {
+    const result = await pgQueries.getReferencesByVolunteer.run(
+      { userId },
+      client
+    )
+    return result.map((v) => {
+      const ret = makeRequired(v)
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getReferencesByVolunteerForAdminDetail(
+  userId: Ulid,
+  client: TransactionClient = getClient()
+): Promise<ReferenceContactInfo[]> {
+  try {
+    const result = await pgQueries.getReferencesByVolunteerForAdminDetail.run(
+      { userId },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeSomeRequired(v, [
+        'id',
+        'firstName',
+        'lastName',
+        'status',
+        'email',
+      ])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type ReferenceWithUserActions = ReferenceContactInfo & {
+  actions: string[]
+}
+
+export async function checkReferenceExistsBeforeAdding(
+  userId: Ulid,
+  email: string
+): Promise<ReferenceWithUserActions | undefined> {
+  try {
+    const result = await pgQueries.checkReferenceExistsBeforeAdding.run(
+      { userId, email: email.toLowerCase() },
+      getClient()
+    )
+    if (result.length) return makeRequired(result[0])
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type VolunteerForPendingStatus = VolunteerContactInfo & {
+  occupations?: string[]
+  country?: string
+  photoIdStatus?: string
+  approved: boolean
+  onboarded: boolean
+  references?: ReferenceContactInfo[]
+}
+
+export async function getVolunteerForPendingStatus(
+  userId: Ulid
+): Promise<VolunteerForPendingStatus | undefined> {
+  try {
+    const result = await pgQueries.getVolunteerForPendingStatus.run(
+      { userId },
+      getClient()
+    )
+    if (!result.length) return
+    const volunteer = makeSomeRequired(result[0], [
+      'id',
+      'firstName',
+      'lastName',
+      'email',
+      'approved',
+      'onboarded',
+    ])
+    volunteer.email = volunteer.email.toLowerCase()
+    const references = await getReferencesByVolunteer(userId)
+    return {
+      ...volunteer,
+      references,
+    }
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function updateVolunteerReferenceStatus(
+  referenceId: Ulid,
+  status: string
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerReferenceStatus.run(
+      { referenceId, status },
+      getClient()
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerApproved(
+  userId: Ulid,
+  approved: boolean,
+  tc: TransactionClient = getClient()
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerApproved.run(
+      { userId, approved },
+      tc
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerOnboarded(
+  userId: Ulid,
+  tc: TransactionClient
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerOnboarded.run(
+      { userId },
+      tc ?? getClient()
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function getVolunteersForNiceToMeetYou(
+  start: Date,
+  end: Date
+): Promise<VolunteerContactInfo[]> {
+  try {
+    const result = await pgQueries.getVolunteersForNiceToMeetYou.run(
+      { start, end },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersForReadyToCoach(): Promise<
+  VolunteerContactInfo[]
+> {
+  try {
+    const result = await pgQueries.getVolunteersForReadyToCoach.run(
+      undefined,
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersForWaitingReferences(
+  start: Date,
+  end: Date
+): Promise<VolunteerContactInfo[]> {
+  try {
+    const result = await pgQueries.getVolunteersForWaitingReferences.run(
+      { start, end },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeSomeOptional(v, ['volunteerPartnerOrg', 'phone'])
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function addVolunteerCertification(
+  userId: Ulid,
+  subject: string,
+  tc: TransactionClient = getClient()
+): Promise<void> {
+  try {
+    const result = await pgQueries.addVolunteerCertification.run(
+      { userId, subject },
+      tc
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateVolunteerQuiz(
+  userId: Ulid,
+  quiz: string,
+  passed: boolean,
+  tc?: TransactionClient
+): Promise<void> {
+  try {
+    const result = await pgQueries.updateVolunteerQuiz.run(
+      { userId, quiz, passed },
+      tc ?? getClient()
+    )
+    if (!result.length && makeRequired(result[0]).ok)
+      throw new RepoUpdateError('update query did not return ok')
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export type CreateVolunteerPayload = {
+  email: string
+  phone: string
+  firstName: string
+  lastName: string
+  password: string
+  referredByCode?: string
+  volunteerPartnerOrg: string | undefined
+  timezone: string | undefined
+  signupSourceId?: number
+  otherSignupSource?: string
+}
+export type CreatedVolunteer = Omit<VolunteerContactInfo, 'roleContext'> & {
+  deactivated: boolean
+  testUser: boolean
+  createdAt: Date
+  isAdmin: boolean
+  smsConsent: boolean
+  userType: UserRole
+  banType?: USER_BAN_TYPES
+  signupSourceId?: number
+  otherSignupSource?: string
+}
+
+export async function createVolunteerProfile(
+  userId: Ulid,
+  {
+    timezone,
+    partnerOrgId,
+  }: {
+    timezone: string | null
+    partnerOrgId: string | null
+  },
+  tc?: TransactionClient
+) {
+  try {
+    const profileResult = await pgQueries.createVolunteerProfile.run(
+      {
+        userId,
+        timezone,
+        partnerOrgId,
+      },
+      tc ?? getClient()
+    )
+    if (!profileResult.length)
+      throw new Error(
+        'Failed to create volunteer profile: Insert did not return new row'
+      )
+  } catch (err) {
+    throw new RepoCreateError(err)
+  }
+}
+
+export async function createUserVolunteerPartnerOrgInstance(
+  {
+    userId,
+    vpoName,
+  }: {
+    userId: string
+    vpoName: string
+  },
+  tc: TransactionClient = getClient()
+) {
+  const vpoInstanceResult =
+    await pgQueries.createUserVolunteerPartnerOrgInstance.run(
+      {
+        userId,
+        vpoName,
+      },
+      tc
+    )
+  if (!makeRequired(vpoInstanceResult)[0].ok)
+    throw new RepoCreateError(
+      'Could not create volunteer: user partner org instance creation did not return rows'
+    )
+  return vpoInstanceResult
+}
+
+export async function createVolunteer(
+  volunteerData: CreateVolunteerPayload,
+  client: TransactionClient
+): Promise<CreatedVolunteer> {
+  try {
+    volunteerData.email = volunteerData.email.toLowerCase()
+    const partnerOrg = volunteerData.volunteerPartnerOrg
+      ? await getPartnerOrgByKey(volunteerData.volunteerPartnerOrg, client)
+      : undefined
+    const userId = getDbUlid()
+    const userResult = await pgQueries.createVolunteerUser.run(
+      {
+        userId,
+        referralCode: generateReferralCode(userId),
+        ...volunteerData,
+        signupSourceId: volunteerData.signupSourceId,
+        otherSignupSource: volunteerData.otherSignupSource,
+        smsConsent: true,
+      },
+      client
+    )
+    if (!userResult.length && makeRequired(userResult[0]).id)
+      throw new Error('Insert query did not return new row')
+    const user = makeSomeOptional(userResult[0], ['banType'])
+    await createVolunteerProfile(
+      userId,
+      {
+        timezone: volunteerData.timezone ?? null,
+        partnerOrgId: partnerOrg?.partnerId ?? null,
+      },
+      client
+    )
+
+    if (partnerOrg) {
+      await createUserVolunteerPartnerOrgInstance(
+        {
+          userId,
+          vpoName: partnerOrg.partnerName,
+        },
+        client
+      )
+    }
+    await insertUserRoleByUserId(userId, USER_ROLES.VOLUNTEER, client)
+    return {
+      ...user,
+      volunteerPartnerOrg: volunteerData.volunteerPartnerOrg,
+      userType: 'volunteer',
+      isAdmin: false,
+    }
+  } catch (err) {
+    throw new RepoCreateError(err)
+  }
+}
+
+export type VolunteerPartnerOrgByKey = {
+  partnerId: Ulid
+  partnerKey: string
+  partnerName: string
+}
+
+export async function getPartnerOrgByKey(
+  partnerKey: string | undefined,
+  client: TransactionClient
+): Promise<VolunteerPartnerOrgByKey | undefined> {
+  if (!partnerKey) return
+  try {
+    const result = await pgQueries.getPartnerOrgByKey.run(
+      {
+        partnerOrgKey: partnerKey,
+      },
+      client
+    )
+    return result.length ? makeRequired(result[0]) : undefined
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+// if partnerOrg isnt provided then remove partnerOrg entirely
+// all other fields override
+export type AdminUpdateVolunteer = {
+  firstName: string | undefined
+  lastName: string | undefined
+  email: string
+  volunteerPartnerOrg: string | undefined
+  isVerified: boolean
+  banType: USER_BAN_TYPES | null
+  isDeactivated: boolean
+  isApproved: boolean | undefined
+}
+
+async function adminUpdateVolunteerPartnerOrgInstance(
+  volunteerId: Ulid,
+  newPartnerOrgKey: string | undefined,
+  client: TransactionClient
+) {
+  try {
+    const newPartnerOrg = await getPartnerOrgByKey(newPartnerOrgKey, client)
+    if (newPartnerOrgKey && !newPartnerOrg)
+      throw new Error(`New partner org ${newPartnerOrgKey} does not exist`)
+
+    const activePartnerOrgInstanceResults =
+      await pgQueries.getPartnerOrgsByVolunteer.run({ volunteerId }, client)
+    const activePartnerOrgInstances = activePartnerOrgInstanceResults.map((v) =>
+      makeRequired(v)
+    )
+
+    // volunteers should not have more than one partner org
+    if (activePartnerOrgInstances.length > 1)
+      throw new Error(
+        `Volunteer ${volunteerId} has more than 1 partner org; cannot update`
+      )
+
+    const activeOrgInstance = activePartnerOrgInstances[0]
+
+    /**
+     *
+     * We attempt to deactive the active instance in two cases:
+     * 1. We're removing a partner org and there is an active instance
+     * 2. We're changing the partner org and there is an active instance
+     *
+     */
+    if (
+      (activeOrgInstance && !newPartnerOrg) ||
+      (activeOrgInstance &&
+        newPartnerOrg &&
+        activeOrgInstance.name !== newPartnerOrg.partnerName)
+    ) {
+      const updateResult =
+        await pgQueries.adminDeactivateVolunteerPartnershipInstance.run(
+          { userId: volunteerId, vpoId: activeOrgInstance.id },
+          client
+        )
+      if (!makeRequired(updateResult[0]).ok)
+        throw new Error(
+          `Deactivating active partner org instance failed for volunteer ${volunteerId}`
+        )
+    }
+
+    /**
+     *
+     * We attempt to add a new active org instance in two cases:
+     * 1. We're adding a new partner org and there is no active instance
+     * 2. We're changing the partner org
+     *
+     */
+    if (
+      (!activeOrgInstance && newPartnerOrg) ||
+      (activeOrgInstance &&
+        newPartnerOrg &&
+        activeOrgInstance.name !== newPartnerOrg.partnerName)
+    ) {
+      const insertResult =
+        await pgQueries.createUserVolunteerPartnerOrgInstance.run(
+          {
+            userId: volunteerId,
+            vpoName: newPartnerOrg.partnerName,
+          },
+          client
+        )
+      if (!makeRequired(insertResult[0]).ok)
+        throw new Error(
+          `Inserting new partner org instance failed for volunteer ${volunteerId}`
+        )
+    }
+  } catch (err) {
+    throw new RepoReadError(`Could not update volunteer partner org: ${err}`)
+  }
+}
+
+export async function updateVolunteerForAdmin(
+  userId: Ulid,
+  update: AdminUpdateVolunteer,
+  tc?: TransactionClient
+): Promise<void> {
+  return runInTransaction(async (client) => {
+    try {
+      const partnerOrgId = update.volunteerPartnerOrg
+        ? await getVolunteerPartnerOrgIdByKey(
+            update.volunteerPartnerOrg,
+            client
+          )
+        : undefined
+      const userResult = await pgQueries.updateVolunteerUserForAdmin.run(
+        {
+          userId,
+          firstName: update.firstName,
+          lastName: update.lastName,
+          email: update.email.toLowerCase(),
+          isVerified: update.isVerified,
+          banType: update.banType,
+          isDeactivated: update.isDeactivated,
+        },
+        client
+      )
+      const profileResult = await pgQueries.updateVolunteerProfilesForAdmin.run(
+        {
+          userId,
+          approved: update.isApproved,
+          partnerOrgId,
+        },
+        client
+      )
+
+      await adminUpdateVolunteerPartnerOrgInstance(
+        userId,
+        update.volunteerPartnerOrg,
+        client
+      )
+
+      if (
+        !(
+          userResult.length &&
+          profileResult.length &&
+          makeRequired(userResult[0]).ok &&
+          makeRequired(profileResult[0]).ok
+        )
+      )
+        throw new RepoUpdateError('update query did not return ok')
+    } catch (err) {
+      throw new RepoUpdateError(err)
+    }
+  }, tc ?? getClient())
+}
+
+export type VolunteerToReview = {
+  id: Ulid
+  firstName: string
+  lastName: string
+  email: string
+  createdAt: Date
+  readyForReviewAt: Date
+}
+export async function getVolunteersToReview(
+  limit: number,
+  offset: number
+): Promise<VolunteerToReview[]> {
+  try {
+    const result = await pgQueries.getVolunteersToReview.run(
+      { limit, offset },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeRequired(v)
+      ret.email = ret.email.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type ReferencesToEmail = {
+  referenceEmail: string
+  referenceFirstName: string
+  referenceId: string
+  referenceLastName: string
+  volunteerFirstName: string
+  volunteerId: string
+  volunteerLastName: string
+}
+export async function getReferencesToFollowup(
+  start: Date,
+  end: Date
+): Promise<ReferencesToEmail[]> {
+  try {
+    const result = await pgQueries.getReferencesToFollowup.run(
+      { start, end },
+      getClient()
+    )
+    return result.map((v) => {
+      const ret = makeRequired(v)
+      ret.referenceEmail = ret.referenceEmail.toLowerCase()
+      return ret
+    })
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getQuizzesPassedForDateRange(
+  userId: Ulid,
+  start: Date,
+  end: Date
+): Promise<number> {
+  try {
+    const result = await pgQueries.getQuizzesPassedForDateRange.run(
+      { userId, start, end },
+      getClient()
+    )
+    return makeRequired(result[0]).total
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export type BackgroundInfo = {
+  approved: boolean | undefined
+  occupation: string[] | undefined
+  languages: string[] | undefined
+  city: string | undefined
+  state: string | undefined
+  country: string | undefined
+  experience:
+    | {
+        collegeCounseling: string
+        mentoring: string
+        tutoring: string
+      }
+    | undefined
+  company: string | undefined
+  college: string | undefined
+  linkedInUrl: string | undefined
+  phoneNumber: string | undefined
+  signupSourceId: number | undefined
+  otherSignupSource: string | undefined
+  highSchoolId?: string | null
+}
+
+export async function deleteVolunteerOccupations(
+  userId: Ulid,
+  tc: TransactionClient = getClient()
+) {
+  try {
+    await pgQueries.deleteVolunteerOccupations.run({ userId }, tc)
+  } catch (err) {
+    throw new RepoDeleteError(err)
+  }
+}
+
+export async function insertVolunteerOccupations(
+  userId: Ulid,
+  occupations: string[],
+  tc: TransactionClient = getClient()
+) {
+  try {
+    await pgQueries.insertVolunteerOccupations.run({ userId, occupations }, tc)
+  } catch (err) {
+    throw new RepoCreateError(err)
+  }
+}
+
+export async function updateVolunteerProfile(
+  userId: Ulid,
+  update: VolunteerProfileUpdate,
+  tc: TransactionClient = getClient()
+): Promise<Ulid> {
+  try {
+    const updatedUserId = await pgQueries.updateVolunteerProfile.run(
+      {
+        userId,
+        ...update,
+      },
+      tc
+    )
+    if (!updatedUserId?.length || !updatedUserId[0].id) {
+      throw new Error(
+        'Did not get back user ID when updating volunteer profile'
+      )
+    }
+    return updatedUserId[0].id
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export async function updateSsoUserBackgroundInfo(
+  userId: Ulid,
+  update: {
+    phone: string | null
+    signupSourceId: number | null
+    otherSignupSource: string | null
+  },
+  tc: TransactionClient = getClient()
+): Promise<Ulid> {
+  try {
+    const updatedUserId = await pgQueries.updateSsoUserBackgroundInfo.run(
+      {
+        userId,
+        phoneNumber: update.phone,
+        signupSourceId: update.signupSourceId,
+        otherSignupSource: update.otherSignupSource,
+      },
+      tc
+    )
+    if (!updatedUserId.length || !updatedUserId[0].id) {
+      throw new Error(
+        'Did not get back user ID when updating SSO user volunteer background info'
+      )
+    }
+    return updatedUserId[0].id
+  } catch (err) {
+    throw new RepoUpdateError(err)
+  }
+}
+
+export type VolunteerForScheduleUpdate = {
+  id: Ulid
+  volunteerPartnerOrg?: string
+  onboarded: boolean
+  availability: Availability
+  subjects?: string[]
+  passedRequiredTraining: boolean
+}
+export async function getVolunteerForScheduleUpdate(
+  userId: Ulid,
+  tc: TransactionClient
+): Promise<VolunteerForScheduleUpdate> {
+  try {
+    const result = await pgQueries.getVolunteerForScheduleUpdate.run(
+      { userId },
+      tc
+    )
+    if (!result.length) throw new RepoReadError('Volunteer not found')
+    const volunteer = makeSomeOptional(result[0], [
+      'volunteerPartnerOrg',
+      'subjects',
+    ])
+    const availability = await getAvailabilityForVolunteer(volunteer.id, tc)
+    return {
+      ...volunteer,
+      availability,
+    }
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+// TODO: break out anything that uses RO client into their own repo
+export async function getUniqueStudentsHelpedForAnalyticsReportSummary(
+  volunteerPartnerOrg: string,
+  start: Date,
+  end: Date
+): Promise<UniqueStudentsHelped> {
+  try {
+    const associatedPartners =
+      await getAssociatedPartnersAndSchools(volunteerPartnerOrg)
+    const result =
+      await pgQueries.getUniqueStudentsHelpedForAnalyticsReportSummary.run(
+        {
+          volunteerPartnerOrg,
+          start,
+          end,
+          studentPartnerOrgIds: associatedPartners.associatedStudentPartnerOrgs,
+          studentSchoolIds: associatedPartners.associatedPartnerSchools,
+        },
+        getRoClient()
+      )
+    if (!(result.length && makeRequired(result[0])))
+      throw new Error(
+        `no volunteer partner org found with key ${volunteerPartnerOrg}`
+      )
+    return makeRequired(result[0])
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+// TODO: break out anything that uses RO client into their own repo
+
+/**
+ * Get the next batch of volunteers for the analytics report.
+ * Uses cursor pagination on user ID (ULID).
+ */
+export async function getVolunteersForAnalyticsReport(
+  volunteerPartnerOrg: string,
+  start: Date,
+  end: Date,
+  associatedPartners: AssociatedPartnersAndSchools,
+  pageSize: number,
+  cursor: Ulid | null
+): Promise<VolunteersForAnalyticsReport[]> {
+  try {
+    const result = await pgQueries.getVolunteersForAnalyticsReport.run(
+      {
+        volunteerPartnerOrg,
+        start,
+        end,
+        studentPartnerOrgIds: associatedPartners.associatedStudentPartnerOrgs,
+        studentSchoolIds: associatedPartners.associatedPartnerSchools,
+        pageSize,
+        cursor,
+      },
+      getAnalyticsClient()
+    )
+
+    if (!result.length) {
+      throw new ReportNoDataFoundError('No volunteers found for partner org')
+    }
+
+    const volunteers = result.map((row) => {
+      const temp = makeSomeOptional(row, [
+        'state',
+        'dateOnboarded',
+        'availabilityLastModifiedAt',
+      ])
+      return {
+        ...temp,
+        // manually parse out incoming bigint to number
+        totalPartnerTimeTutored: Number(temp.totalPartnerTimeTutored),
+        totalPartnerTimeTutoredWithinRange: Number(
+          temp.totalPartnerTimeTutoredWithinRange
+        ),
+      } as VolunteersForAnalyticsReport
+    })
+    return volunteers
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getActiveSponsorshipsByUserId(
+  userId: Ulid
+): Promise<Sponsorship[]> {
+  try {
+    const result = await pgQueries.getActiveSponsorshipsByUserId.run(
+      { userId },
+      getRoClient()
+    )
+    return result.map((v) => makeRequired(v))
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteerSubjects(
+  userId: Uuid,
+  tc?: TransactionClient
+): Promise<VolunteerSubject[]> {
+  try {
+    const result = await pgQueries.getVolunteerSubjects.run(
+      { userId },
+      tc ?? getClient()
+    )
+    if (result.length) return result.map((row) => makeRequired(row))
+    return []
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteerMutedSubjects(
+  userId: Uuid,
+  tc?: TransactionClient
+): Promise<VolunteerSubject[]> {
+  try {
+    const result = await pgQueries.getVolunteerMutedSubjects.run(
+      { userId },
+      tc ?? getClient()
+    )
+    if (result.length) return result.map((row) => makeRequired(row))
+    return []
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersForTextNotifications(): Promise<
+  TextableVolunteer[]
+> {
+  try {
+    const rawResults =
+      await pgQueries.getVolunteersForTextNotificationsInTheCurrentHour.run(
+        undefined,
+        getRoClient()
+      )
+    return rawResults.map((row) =>
+      makeSomeOptional(row, ['volunteerPartnerOrgKey', 'occupations'])
+    )
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+export async function doesVolunteerWithEmailExist(email: string) {
+  try {
+    const rawResults = await pgQueries.doesVolunteerWithEmailExist.run(
+      { email },
+      getRoClient()
+    )
+    return rawResults[0].exists
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteersReadyToCoachStatus(
+  volunteerIds: Ulid[],
+  tc: TransactionClient = getRoClient()
+) {
+  try {
+    const results = await pgQueries.getVolunteersReadyToCoachStatus.run(
+      {
+        volunteerIds,
+      },
+      tc
+    )
+    return results.map((row) => makeSomeOptional(row, ['banType']))
+  } catch (err) {
+    throw new RepoReadError(err)
+  }
+}
+
+export async function getVolunteerOccupations(
+  userId: Ulid,
+  tc: TransactionClient = getRoClient()
+): Promise<VolunteerOccupations[]> {
+  try {
+    const results = await pgQueries.getVolunteerOccupations.run({ userId }, tc)
+    return results.map(
+      (row) => makeRequired(row).occupation as VolunteerOccupations
+    )
+  } catch (error) {
+    throw new RepoReadError(error)
+  }
+}

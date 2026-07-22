@@ -1,0 +1,489 @@
+import { Express, Router, Request, Response } from 'express'
+import passport from 'passport'
+import * as AuthService from '../../services/AuthService'
+import * as FedCredService from '../../services/FederatedCredentialService'
+import * as StudentService from '../../services/StudentService'
+import * as UserCreationService from '../../services/UserCreationService'
+import { switchActiveRole } from '../../services/UserRolesService'
+import {
+  asResetConfirmData,
+  authPassport,
+  getSsoProviderFromRequest,
+  isSupportedSsoProvider,
+  registerStudentValidator,
+  registerTeacherValidator,
+  SessionWithSsoData,
+} from '../../utils/auth-utils'
+import { InputError, LookupError } from '../../models/Errors'
+import { resError } from '../res-error'
+import { getUserIdByEmail } from '../../models/User/queries'
+import { asString } from '../../utils/type-utils'
+import { getUuid, Ulid } from '../../models/pgUtils'
+import logger from '../../logger'
+import { getLegacyUserObject } from '../../models/User/legacy-user'
+import { extractUser } from '../extract-user'
+import config from '../../config'
+import { ACCOUNT_USER_ACTIONS } from '../../constants'
+import { createAccountAction } from '../../models/UserAction'
+import { AuthRedirect } from './auth-redirect'
+import { v4 as uuidv4 } from 'uuid'
+import { UserRole } from '../../models/User'
+
+async function trackLoggedIn(userId: Ulid, ipAddress?: string) {
+  await createAccountAction({
+    userId,
+    action: ACCOUNT_USER_ACTIONS.LOGGED_IN,
+    ipAddress,
+  })
+}
+
+export function routes(app: Express) {
+  const router = Router()
+
+  router.route('/status').get(function (req, res) {
+    if (!req.user) {
+      return res.json({ authenticated: false })
+    }
+    if (req.user.isAdmin) {
+      return res.json({
+        authenticated: true,
+        isAdmin: true,
+        totpVerified: authPassport.isTotpSessionValid(
+          req.session.totpVerifiedAt
+        ),
+      })
+    }
+    return res.json({ authenticated: true })
+  })
+
+  router.route('/logout').get(async function (req, res) {
+    await req.asyncLogout()
+
+    res.json({
+      msg: 'You have been logged out!',
+    })
+
+    const userId = req.user?.id
+    if (userId) {
+      await createAccountAction({
+        userId,
+        action: ACCOUNT_USER_ACTIONS.LOGGED_OUT,
+        ipAddress: req.ip,
+      })
+    }
+  })
+
+  router.route('/login').post(
+    passport.authenticate('local'),
+    // If successfully authed, return user object (otherwise 401 is returned from middleware).
+    async function (req: Request, res: Response) {
+      const user = await getLegacyUserObject(extractUser(req).id)
+
+      if (
+        req.body?.forceLoginWithRole &&
+        user.roleContext.hasRole(req.body.forceLoginWithRole)
+      ) {
+        const { newRoleContext } = await switchActiveRole(
+          user.id,
+          req.body.forceLoginWithRole
+        )
+        user.roleContext = newRoleContext
+        user.userType = newRoleContext.activeRole
+      }
+
+      await trackLoggedIn(user.id, req.ip || '')
+      res.json({ user })
+    }
+  )
+
+  router.route('/sso').get((req, res) => {
+    const provider = req.query.provider as string
+    const isLogin = req.query.isLogin ? req.query.isLogin === 'true' : true
+    const errorRedirect = req.query.errorRedirect as string
+    const accountType = req.query.accountType ?? 'student'
+    if (!provider || !isSupportedSsoProvider(provider)) {
+      res.redirect(
+        AuthRedirect.failureRedirect(isLogin, provider ?? '', errorRedirect)
+      )
+      return
+    }
+
+    ;(req.session as SessionWithSsoData).sso = {
+      userData: !isLogin
+        ? {
+            ...req.query,
+            ip: req.ip,
+          }
+        : undefined,
+      provider,
+      isLogin,
+      accountType: accountType as Extract<
+        UserRole,
+        'student' | 'volunteer' | 'teacher'
+      >,
+      redirect: req.query.redirect as string,
+      errorRedirect,
+    }
+
+    const strategy = provider
+    passport.authenticate(strategy)(req, res)
+  })
+  // Redirect URI for SSO providers.
+  router.route('/oauth2/redirect').get((req, res) => {
+    const {
+      provider = getSsoProviderFromRequest(req),
+      isLogin = true,
+      redirect = '',
+      errorRedirect = '',
+      userData = {},
+    } = (req.session as SessionWithSsoData).sso ?? {}
+    if (!provider || !isSupportedSsoProvider(provider)) {
+      res.redirect(
+        AuthRedirect.failureRedirect(
+          isLogin,
+          provider,
+          errorRedirect,
+          userData,
+          `Unknown provider: ${provider}`
+        )
+      )
+      return
+    }
+    const strategy = provider
+    passport.authenticate(
+      strategy,
+      async function (
+        _err: any,
+        user?: Express.User,
+        data?: {
+          profileId?: string
+          issuer?: string
+          firstName?: string
+          lastName?: string
+          errorMessage?: string
+        }
+      ) {
+        if (data?.profileId && data?.issuer) {
+          const validator = getUuid()
+          ;(req.session as SessionWithSsoData).sso = {
+            fedCredData: {
+              profileId: data.profileId,
+              issuer: data.issuer,
+              validator,
+            },
+            userData: {
+              ...userData,
+              firstName: data.firstName,
+              lastName: data.lastName,
+            },
+          }
+          return res.redirect(AuthRedirect.emailRedirect(validator))
+        }
+
+        if (user) {
+          await req.asyncLogin(user)
+          return res.redirect(AuthRedirect.successRedirect(redirect))
+        } else {
+          return res.redirect(
+            AuthRedirect.failureRedirect(
+              isLogin,
+              provider,
+              errorRedirect,
+              userData,
+              data?.errorMessage
+            )
+          )
+        }
+      }
+    )(req, res)
+  })
+
+  router.route('/register/checkcred').post(async function (req, res) {
+    try {
+      const checked = await AuthService.checkCredential(req.body as unknown)
+      return res.json({ checked })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router
+    .route('/register/student')
+    .post(authPassport.checkRecaptcha, async function (req, res) {
+      try {
+        const { fedCredData } = (req.session as SessionWithSsoData).sso ?? {}
+        if (fedCredData && req.body.validator === fedCredData.validator) {
+          const existingStudent = await StudentService.getStudentByEmail(
+            req.body.email
+          )
+          if (existingStudent) {
+            await FedCredService.linkAccount(
+              fedCredData.profileId,
+              fedCredData.issuer,
+              existingStudent.id
+            )
+            await req.asyncLogin({ id: existingStudent.id, isAdmin: false })
+            delete (req.session as SessionWithSsoData).sso
+            return res.json({ user: existingStudent })
+          }
+        } else {
+          delete (req.session as SessionWithSsoData).sso
+        }
+
+        const phCookie = config.posthogToken
+          ? req.cookies[`ph_${config.posthogToken}_posthog`]
+          : null
+
+        const distinctId = phCookie
+          ? JSON.parse(phCookie).distinct_id
+          : uuidv4()
+
+        const data = registerStudentValidator({
+          ...req.body,
+          ...((req.session as SessionWithSsoData).sso?.fedCredData ?? {}),
+          ...((req.session as SessionWithSsoData).sso?.userData ?? {}),
+          ip: req.ip,
+          phId: distinctId,
+        })
+        const student = await UserCreationService.registerStudent(data)
+        if (
+          data.password ||
+          (req.session as SessionWithSsoData).sso?.fedCredData
+        ) {
+          await req.asyncLogin(student)
+        }
+        delete (req.session as SessionWithSsoData).sso
+        return res.json({ user: student })
+      } catch (e) {
+        resError(res, e)
+      }
+    })
+
+  // == Remove once midtown clean-up.
+  router.route('/register/student/open').post(async function (req, res) {
+    try {
+      const phCookie = config.posthogToken
+        ? req.cookies[`ph_${config.posthogToken}_posthog`]
+        : null
+
+      const distinctId = phCookie ? JSON.parse(phCookie).distinct_id : uuidv4()
+
+      const data = registerStudentValidator({
+        ...req.body,
+        gradeLevel: req.body.currentGrade,
+        schoolId: req.body.highSchoolId,
+        ip: req.ip,
+        phId: distinctId,
+      })
+      const student = await UserCreationService.registerStudent(data)
+      await req.asyncLogin(student)
+      return res.json({ user: student })
+    } catch (e) {
+      resError(res, e)
+    }
+  })
+
+  // == Remove once midtown clean-up.
+  router.route('/register/student/partner').post(async function (req, res) {
+    try {
+      const phCookie = config.posthogToken
+        ? req.cookies[`ph_${config.posthogToken}_posthog`]
+        : null
+
+      const distinctId = phCookie ? JSON.parse(phCookie).distinct_id : uuidv4()
+
+      const data = registerStudentValidator({
+        ...req.body,
+        gradeLevel: req.body.currentGrade,
+        schoolId: req.body.highSchoolId,
+        studentPartnerOrgKey: req.body.studentPartnerOrg,
+        studentPartnerOrgSiteName: req.body.partnerSite,
+        ip: req.ip,
+        phId: distinctId,
+      })
+      const student = await UserCreationService.registerStudent(data)
+      await req.asyncLogin(student)
+      return res.json({ user: student })
+    } catch (e) {
+      resError(res, e)
+    }
+  })
+
+  router
+    .route('/register/teacher')
+    .post(authPassport.checkRecaptcha, async function (req, res) {
+      try {
+        const data = registerTeacherValidator({
+          ...req.body,
+          ip: req.ip,
+        })
+        const teacher = await UserCreationService.registerTeacher(data)
+        await req.asyncLogin(teacher)
+        return res.json({ user: teacher })
+      } catch (e) {
+        resError(res, e)
+      }
+    })
+
+  // TODO: Replace with /register/volunteer.
+  router
+    .route('/register/volunteer/open')
+    .post(authPassport.checkRecaptcha, async function (req, res) {
+      try {
+        // TODO replace this with UserCreationService.regsterVolunteer.
+        const volunteer = await AuthService.registerVolunteer({
+          ...req.body,
+          ip: req.ip,
+        } as unknown)
+        await req.asyncLogin(volunteer)
+        await trackLoggedIn(volunteer.id, req.ip)
+        res.json({ user: volunteer })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  // TODO: Replace this with /register/volunteer.
+  router
+    .route('/register/volunteer/partner')
+    .post(authPassport.checkRecaptcha, async function (req, res) {
+      try {
+        const volunteer = await AuthService.registerPartnerVolunteer({
+          ...req.body,
+          ip: req.ip,
+        } as unknown)
+        await req.asyncLogin(volunteer)
+        await trackLoggedIn(volunteer.id, req.ip)
+        res.json({ user: volunteer })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  router.route('/partner/volunteer').get(async function (req, res) {
+    try {
+      if (!('partnerId' in req.query))
+        throw new InputError('Missing volunteerPartnerId query string')
+      const partner = await AuthService.lookupPartnerVolunteer(
+        req.query.partnerId as unknown
+      )
+      res.json({ volunteerPartner: partner })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.route('/partner/student').get(async function (req, res) {
+    try {
+      if (!('partnerId' in req.query))
+        throw new InputError('Missing studentPartnerId query string')
+      const partner = await AuthService.lookupPartnerStudent(
+        req.query.partnerId as unknown
+      )
+      res.json({
+        studentPartner: {
+          ...partner,
+          isManuallyApproved:
+            partner.key === config.customManualStudentPartnerOrg,
+        },
+      })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router.route('/partner/student/code').get(async function (req, res) {
+    try {
+      if (!('partnerSignupCode' in req.query))
+        throw new InputError('Missing partnerSignupCode query string')
+      const studentPartnerKey = await AuthService.lookupPartnerStudentCode(
+        req.query.partnerSignupCode as unknown
+      )
+      res.json({ studentPartnerKey })
+    } catch (err) {
+      resError(res, err)
+    }
+  })
+
+  router
+    .route('/partner/student-partners')
+    .all(authPassport.isAdmin)
+    .get(async function (req, res) {
+      try {
+        const partnerOrgs = await AuthService.lookupStudentPartners()
+        res.json({ partnerOrgs })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  router
+    .route('/partner/volunteer-partners')
+    .all(authPassport.isAdmin)
+    .get(async function (req, res) {
+      try {
+        const partnerOrgs = await AuthService.lookupVolunteerPartners()
+        res.json({ partnerOrgs })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  router
+    .route('/partner/sponsor-orgs')
+    .all(authPassport.isAdmin)
+    .get(async function (req, res) {
+      try {
+        const sponsorOrgs = await AuthService.lookupSponsorOrgs()
+        res.json({ sponsorOrgs })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  router
+    .route('/reset/send')
+    .post(authPassport.checkRecaptcha, async function (req, res) {
+      try {
+        const reqEmail = asString(req.body.email)
+        const email = reqEmail.toLowerCase()
+        try {
+          await AuthService.sendReset(email as unknown)
+        } catch (err) {
+          // do not respond with info about no email match
+          if (!(err instanceof LookupError)) return resError(res, err) // will handle sending response with status/error
+          logger.info(err) // log expected lookup errors
+        }
+
+        if (req.user) {
+          await req.asyncLogout()
+        }
+        res.status(200).json({
+          msg: 'If an account with this email address exists then we will send a password reset email',
+        })
+      } catch (err) {
+        resError(res, err)
+      }
+    })
+
+  router.post(
+    '/reset/confirm',
+    authPassport.checkRecaptcha,
+    async function (req: Request, res: Response) {
+      try {
+        const data = asResetConfirmData(req.body)
+        await AuthService.confirmReset(data)
+        const userId = (await getUserIdByEmail(req.body.email))?.id
+        if (userId) {
+          await AuthService.deleteAllUserSessions(userId)
+          await req.asyncLogin({ id: userId, isAdmin: false })
+        }
+        res.redirect('/')
+      } catch (err) {
+        resError(res, err)
+      }
+    }
+  )
+
+  app.use('/auth', router)
+}

@@ -1,0 +1,47 @@
+.DS_Store
+node_modules
+/dist
+
+public/version.json
+
+# env files
+.env
+.env.development
+.env.local
+.env.*.local
+.env.test_e2e_ci
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+newrelic_agent.log
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# python virtual environment
+.venv
+
+# Personal files
+todo.local.md
+
+# Log file from e2e tests.
+high-line.log
+
+stats.html
+
+# We no longer use npm.
+package-lock.json
